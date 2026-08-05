@@ -8,6 +8,7 @@ pub mod capture;
 pub mod captions;
 pub mod clipboard;
 pub mod error;
+pub mod micmon;
 pub mod paths;
 pub mod record;
 pub mod srt;

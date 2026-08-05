@@ -126,6 +126,15 @@ struct LauncherView {
     sel_start: Option<Point<Pixels>>,
     sel_end: Option<Point<Pixels>>,
     dragging: bool,
+    /// Pre-record mic check: running pipeline (dropping it stops the child),
+    /// whether the user hears themselves, whether the recording DSP chain is
+    /// applied, latest (rms, peak) dBFS, and a generation counter so a
+    /// restart retires the previous poll loop.
+    mic_test: Option<ashot_core::micmon::MicMonitor>,
+    mic_hear: bool,
+    mic_dsp_on: bool,
+    mic_level: (f32, f32),
+    mic_test_gen: usize,
     focus_handle: FocusHandle,
 }
 
@@ -174,7 +183,61 @@ impl LauncherView {
             sel_start: None,
             sel_end: None,
             dragging: false,
+            mic_test: None,
+            mic_hear: false,
+            mic_dsp_on: true,
+            mic_level: (ashot_core::micmon::FLOOR_DB, ashot_core::micmon::FLOOR_DB),
+            mic_test_gen: 0,
             focus_handle: cx.focus_handle(),
+        }
+    }
+
+    // ---- mic check ----
+
+    fn start_mic_test(&mut self, cx: &mut Context<Self>) {
+        let Some(device) = self.mics[self.mic_ix].0.clone() else { return };
+        match ashot_core::micmon::start(Some(&device), self.mic_dsp_on, self.mic_hear) {
+            Ok(m) => {
+                self.mic_test = Some(m);
+                self.mic_level = (ashot_core::micmon::FLOOR_DB, ashot_core::micmon::FLOOR_DB);
+                self.mic_test_gen += 1;
+                let gen = self.mic_test_gen;
+                cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor().timer(Duration::from_millis(80)).await;
+                        let alive = this.update(cx, |this, cx| {
+                            if this.mic_test_gen != gen {
+                                return false;
+                            }
+                            match &this.mic_test {
+                                Some(m) => {
+                                    this.mic_level = m.level();
+                                    cx.notify();
+                                    true
+                                }
+                                None => false,
+                            }
+                        });
+                        if !matches!(alive, Ok(true)) {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+            Err(e) => eprintln!("mic check failed to start: {e}"),
+        }
+    }
+
+    fn stop_mic_test(&mut self) {
+        // Dropping the monitor kills the gst child.
+        self.mic_test = None;
+    }
+
+    fn restart_mic_test(&mut self, cx: &mut Context<Self>) {
+        if self.mic_test.is_some() {
+            self.stop_mic_test();
+            self.start_mic_test(cx);
         }
     }
 
@@ -264,6 +327,8 @@ impl LauncherView {
         } else {
             None
         };
+        // Release the mic before the recording pipeline opens it.
+        self.stop_mic_test();
         window.remove_window();
         match (self.mode, crop) {
             (Mode::Screenshot, None) => {
@@ -365,6 +430,7 @@ impl LauncherView {
                         |this, _, cx| {
                             this.mode = Mode::Screenshot;
                             this.mic_open = false;
+                            this.stop_mic_test();
                             cx.notify();
                         },
                     ))
@@ -460,6 +526,35 @@ impl LauncherView {
                         }),
                     ),
             );
+            if self.mic_ix > 0 {
+                let testing = self.mic_test.is_some();
+                pill = pill.child(
+                    div()
+                        .id("mictest")
+                        .px_3()
+                        .py_1()
+                        .flex_none()
+                        .rounded_full()
+                        .cursor(CursorStyle::PointingHand)
+                        .bg(theme::surface())
+                        .border_1()
+                        .border_color(if testing { theme::accent() } else { theme::border() })
+                        .text_sm()
+                        .text_color(if testing { theme::text() } else { theme::text_muted() })
+                        .child("🎧 Test")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                if this.mic_test.is_some() {
+                                    this.stop_mic_test();
+                                } else {
+                                    this.start_mic_test(cx);
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                );
+            }
         }
 
         pill.child(div().flex_1()).child(
@@ -479,6 +574,118 @@ impl LauncherView {
                     cx.listener(|this, _: &MouseDownEvent, window, cx| this.fire(window, cx)),
                 ),
         )
+    }
+
+    /// Meter + toggles shown below the pill while the mic check runs. The
+    /// fill bar is RMS, the tick is peak; calibrate the external mic's gain
+    /// until peaks sit in the yellow (−12…−6 dB).
+    fn mic_check_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        const METER_W: f32 = 240.0;
+        let (rms, peak) = self.mic_level;
+        let frac = |db: f32| {
+            ((db - ashot_core::micmon::FLOOR_DB) / -ashot_core::micmon::FLOOR_DB).clamp(0.0, 1.0)
+        };
+        let fill_color = if peak > -6.0 {
+            gpui::rgb(0xff3b30)
+        } else if peak > -12.0 {
+            gpui::rgb(0xffcc00)
+        } else {
+            gpui::rgb(0x34c759)
+        };
+        let toggle = |id: &'static str,
+                      label: SharedString,
+                      on: bool,
+                      cx: &mut Context<Self>,
+                      handler: fn(&mut Self, &mut Context<Self>)| {
+            div()
+                .id(id)
+                .px_3()
+                .py_1()
+                .flex_none()
+                .rounded_full()
+                .cursor(CursorStyle::PointingHand)
+                .bg(theme::surface())
+                .border_1()
+                .border_color(if on { theme::accent() } else { theme::border() })
+                .text_sm()
+                .text_color(if on { theme::text() } else { theme::text_muted() })
+                .child(label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        handler(this, cx);
+                        cx.notify();
+                    }),
+                )
+        };
+        div()
+            .mt_2()
+            .w(px(440.))
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_lg()
+            .bg(theme::bg())
+            .border_1()
+            .border_color(theme::border())
+            .shadow_lg()
+            .occlude()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .relative()
+                            .w(px(METER_W))
+                            .h(px(10.))
+                            .rounded_full()
+                            .bg(theme::surface())
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .w(px(frac(rms) * METER_W))
+                                    .h_full()
+                                    .rounded_full()
+                                    .bg(fill_color),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px((frac(peak) * METER_W - 1.0).max(0.0)))
+                                    .top_0()
+                                    .w(px(2.))
+                                    .h_full()
+                                    .bg(gpui::rgb(0xffffff)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme::text())
+                            .child(format!("{:.0} dB", peak.max(ashot_core::micmon::FLOOR_DB))),
+                    )
+                    .child(div().flex_1())
+                    .child(toggle("mic-hear", "🎧 Hear myself".into(), self.mic_hear, cx, |this, cx| {
+                        this.mic_hear = !this.mic_hear;
+                        this.restart_mic_test(cx);
+                    }))
+                    .child(toggle("mic-dsp", "✨ Processing".into(), self.mic_dsp_on, cx, |this, cx| {
+                        this.mic_dsp_on = !this.mic_dsp_on;
+                        this.restart_mic_test(cx);
+                    })),
+            )
+            .child(
+                div().text_xs().text_color(theme::text_muted()).child(
+                    "Speak normally; set your mic's gain so peaks sit around −12 to −6 dB. \
+                     Use headphones with Hear myself to avoid feedback.",
+                ),
+            )
     }
 
     fn mic_dropdown(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -513,6 +720,12 @@ impl LauncherView {
                         cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                             this.mic_ix = ix;
                             this.mic_open = false;
+                            if ix == 0 {
+                                this.stop_mic_test();
+                            } else {
+                                // Re-meter the newly selected device.
+                                this.restart_mic_test(cx);
+                            }
                             cx.notify();
                         }),
                     )
@@ -552,7 +765,11 @@ impl Render for LauncherView {
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 match ev.keystroke.key.as_str() {
                     "escape" if this.crop_session => this.leave_crop(Scope::Full, window, cx),
-                    "escape" => cx.quit(),
+                    "escape" => {
+                        // Kill the mic-check child before the process exits.
+                        this.stop_mic_test();
+                        cx.quit()
+                    }
                     "enter" => this.fire(window, cx),
                     _ => {}
                 }
@@ -636,6 +853,9 @@ impl Render for LauncherView {
             if self.mic_open && record {
                 root = root.child(self.mic_dropdown(cx));
             }
+            if record && self.mic_test.is_some() {
+                root = root.child(self.mic_check_panel(cx));
+            }
             if self.sel_rect().is_none() {
                 root = root.child(
                     div()
@@ -655,6 +875,9 @@ impl Render for LauncherView {
             root = root.child(div().mt_2().child(pill));
             if self.mic_open && record {
                 root = root.child(self.mic_dropdown(cx));
+            }
+            if record && self.mic_test.is_some() {
+                root = root.child(self.mic_check_panel(cx));
             }
         }
 
