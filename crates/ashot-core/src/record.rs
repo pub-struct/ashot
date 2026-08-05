@@ -153,7 +153,7 @@ fn controller_script_path() -> Result<PathBuf> {
     Ok(path)
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RecordOptions {
     /// Defaults to ~/Videos/Screencasts/rec-<timestamp>.mp4
     pub output: Option<PathBuf>,
@@ -166,6 +166,22 @@ pub struct RecordOptions {
     pub mic: Option<String>,
     /// Also record system audio (the default output's monitor source).
     pub system_audio: bool,
+    /// Apply webrtcdsp voice processing (noise suppression/AGC) to the mic
+    /// chain. Defaults to true; set false for the plain pre-processing path.
+    pub voice_process: bool,
+}
+
+impl Default for RecordOptions {
+    fn default() -> Self {
+        Self {
+            output: None,
+            height: None,
+            crop: None,
+            mic: None,
+            system_audio: false,
+            voice_process: true,
+        }
+    }
 }
 
 pub struct Recording {
@@ -488,9 +504,12 @@ fn spawn_gst(
                 // Voice processing fixes raw-mic capture: AGC evens out quiet
                 // and hot mics (with a limiter against clipping) and noise
                 // suppression cleans the floor. Fallback: plain chain.
-                let dsp = if gst_has_element("webrtcdsp") {
+                let dsp = if opts.voice_process && gst_has_element("webrtcdsp") {
                     "! audio/x-raw,rate=48000,channels=1,format=S16LE \
-                     ! webrtcdsp echo-cancel=false noise-suppression=true gain-control=true \
+                     ! webrtcdsp echo-cancel=false noise-suppression=true \
+                     noise-suppression-level=low gain-control=true \
+                     gain-control-mode=fixed-digital target-level-dbfs=9 \
+                     limiter=true high-pass-filter=false \
                      ! audioconvert "
                 } else {
                     ""

@@ -705,6 +705,7 @@ pub fn start_recording_flow(
                     crop,
                     mic,
                     system_audio,
+                    voice_process: true,
                 })
             })
             .await;
