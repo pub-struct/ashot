@@ -51,8 +51,10 @@ def on_msg(bus, msg):
     if msg.type == Gst.MessageType.EOS:
         quit_loop()
     elif msg.type == Gst.MessageType.ERROR:
-        err, _ = msg.parse_error()
-        print('gst-error: ' + err.message, file=sys.stderr, flush=True)
+        err, dbg = msg.parse_error()
+        src = msg.src.get_name() if msg.src else '?'
+        print('gst-error: [' + src + '] ' + err.message + ' | ' + (dbg or ''),
+              file=sys.stderr, flush=True)
         exit_code = 1
         quit_loop()
 
@@ -234,38 +236,54 @@ pub fn start_recording(opts: RecordOptions) -> Result<Recording> {
         .find(|(_, h, _)| *h >= out_h)
         .map_or(16_000, |(_, _, kbps)| *kbps);
 
-    let gpu = gst_has_element("vah264enc");
-    let spawn_instant = Instant::now();
-    let (encoder, mut child) = spawn_gst(
-        &stream, &opts, &path, out_w, out_h, bitrate,
-        if gpu { "vah264enc" } else { "x264enc" },
-    )?;
-
-    // If the GPU pipeline dies immediately (format negotiation, driver quirks),
-    // fall back to CPU encoding once rather than failing the recording.
-    std::thread::sleep(Duration::from_millis(1200));
-    let (encoder, child) = match child.try_wait() {
-        Ok(Some(status)) if encoder == "vah264enc" => {
+    // Startup can die transiently (GPU format negotiation, driver quirks, and
+    // a latency-negotiation race between the audio branches and the mixer in
+    // dual-source mode), so retry: same encoder once, then the CPU fallback.
+    let attempts: &[&'static str] = if gst_has_element("vah264enc") {
+        &["vah264enc", "vah264enc", "x264enc", "x264enc"]
+    } else {
+        &["x264enc", "x264enc", "x264enc"]
+    };
+    let mut keeper = Some(keeper);
+    let mut stream = stream;
+    let mut last_status = String::new();
+    for (i, enc) in attempts.iter().enumerate() {
+        if i > 0 {
+            // Portal fd was consumed by the dead child; need a fresh stream.
+            drop(keeper.take());
+            let (keeper2, stream2) = open_portal_stream()?;
+            keeper = Some(keeper2);
+            stream = stream2;
+        }
+        let spawn_instant = Instant::now();
+        let (encoder, mut child) = spawn_gst(&stream, &opts, &path, out_w, out_h, bitrate, enc)?;
+        std::thread::sleep(Duration::from_millis(1200));
+        if let Ok(Some(status)) = child.try_wait() {
+            last_status = status.to_string();
             eprintln!(
                 "{}",
                 serde_json::json!({
-                    "warning": format!("GPU pipeline exited at startup ({status}); falling back to CPU x264"),
+                    "warning": format!(
+                        "{enc} pipeline exited at startup ({status}); attempt {}/{}",
+                        i + 1,
+                        attempts.len()
+                    ),
                 })
             );
-            // Portal fd was consumed by the dead child; need a fresh stream.
-            drop(keeper);
-            let (keeper2, stream2) = open_portal_stream()?;
-            let (enc, child2) =
-                spawn_gst(&stream2, &opts, &path, out_w, out_h, bitrate, "x264enc")?;
-            return finish_start(keeper2, child2, enc, path, out_w, out_h, opts.mic.is_some() || opts.system_audio, Instant::now());
+            continue;
         }
-        Ok(Some(status)) => {
-            return Err(Error::Record(format!("encoder exited at startup: {status}")));
-        }
-        _ => (encoder, child),
-    };
-
-    finish_start(keeper, child, encoder, path, out_w, out_h, opts.mic.is_some() || opts.system_audio, spawn_instant)
+        return finish_start(
+            keeper.take().unwrap(),
+            child,
+            encoder,
+            path,
+            out_w,
+            out_h,
+            opts.mic.is_some() || opts.system_audio,
+            spawn_instant,
+        );
+    }
+    Err(Error::Record(format!("encoder exited at startup after retries: {last_status}")))
 }
 
 fn finish_start(
@@ -455,6 +473,24 @@ fn map_portal_err(err: ashpd::Error) -> Error {
     }
 }
 
+/// Voice-processing fragment shared by recording and the pre-record mic
+/// check (`micmon`), so what the check meters/plays is exactly what a
+/// recording captures. AGC evens out quiet and hot mics (with a limiter
+/// against clipping) and noise suppression cleans the floor; empty string
+/// (plain chain) when disabled or webrtcdsp is missing.
+pub(crate) fn mic_dsp(voice_process: bool) -> &'static str {
+    if voice_process && gst_has_element("webrtcdsp") {
+        "! audio/x-raw,rate=48000,channels=1,format=S16LE \
+         ! webrtcdsp echo-cancel=false noise-suppression=true \
+         noise-suppression-level=low gain-control=true \
+         gain-control-mode=fixed-digital target-level-dbfs=9 \
+         limiter=true high-pass-filter=false \
+         ! audioconvert "
+    } else {
+        ""
+    }
+}
+
 fn spawn_gst(
     stream: &PortalStream,
     opts: &RecordOptions,
@@ -488,41 +524,82 @@ fn spawn_gst(
              ! h264parse "
         );
     }
-    line += "! mux. ";
-    line += &format!("mp4mux name=mux ! filesink location={} ", shell_safe(path)?);
+    // Deep compressed-side queue: when the audio path runs behind (e.g. the
+    // audiomixer's latency in the dual-source case), mp4mux holds video back;
+    // without slack here that backpressure reaches pipewiresrc, which aborts
+    // the stream. Post-encoder H.264 is cheap to buffer (~1.2MB/s at 10Mbps).
+    line += "! queue max-size-time=10000000000 max-size-buffers=0 max-size-bytes=0 ! mux. ";
+    // mp4mux is aggregator-based (gst >= 1.24) and runs in live mode when fed
+    // by live sources; its default deadline is far shorter than the portal +
+    // encoder warm-up, and a missed deadline flushes the pipeline (surfacing
+    // as "Internal data stream error" from an audio source). `latency` is the
+    // documented budget for exactly that.
+    line += &format!("mp4mux name=mux latency=5000000000 ! filesink location={} ", shell_safe(path)?);
     let system_monitor = if opts.system_audio { default_monitor_source() } else { None };
     if opts.mic.is_some() || system_monitor.is_some() {
         if let Some(aac) = ["avenc_aac", "voaacenc"].iter().find(|e| gst_has_element(e)) {
-            // Mixer handles one or both sources; the valve implements pause.
-            line += &format!(
-                "audiomixer name=amix ! audioconvert ! audioresample \
-                 ! identity name=agate ! {aac} bitrate=128000 ! aacparse ! mux. "
-            );
-            if let Some(mic) = &opts.mic {
-                let device =
-                    if mic == "default" { String::new() } else { format!(" device={mic}") };
-                // Voice processing fixes raw-mic capture: AGC evens out quiet
-                // and hot mics (with a limiter against clipping) and noise
-                // suppression cleans the floor. Fallback: plain chain.
-                let dsp = if opts.voice_process && gst_has_element("webrtcdsp") {
-                    "! audio/x-raw,rate=48000,channels=1,format=S16LE \
-                     ! webrtcdsp echo-cancel=false noise-suppression=true \
-                     noise-suppression-level=low gain-control=true \
-                     gain-control-mode=fixed-digital target-level-dbfs=9 \
-                     limiter=true high-pass-filter=false \
-                     ! audioconvert "
-                } else {
-                    ""
-                };
-                line += &format!(
-                    "pulsesrc{device} ! queue ! audioconvert ! audioresample \
-                     {dsp}! volume name=vol ! amix. "
-                );
-            }
-            if let Some(monitor) = &system_monitor {
-                line += &format!(
-                    "pulsesrc device={monitor} ! queue ! audioconvert ! audioresample ! amix. "
-                );
+            // Deep (10s) audio queues: mp4mux doesn't flow until the video
+            // branch produces (portal/VA-API warm-up can take seconds), and a
+            // default 1s queue fills, blocks pulsesrc, and drops samples —
+            // audible as heavy mic stutter at the start of every recording.
+            // Buffer the start-up stall instead of dropping through it.
+            const AQ: &str = "queue max-size-time=10000000000 max-size-buffers=0 max-size-bytes=0";
+            match (&opts.mic, &system_monitor) {
+                // Both sources: they must be mixed, but audiomixer's default
+                // latency of 0 silently DROPS live buffers that arrive late
+                // (encoder warm-up load makes that the norm early on) and
+                // zero-fills their timeslots — heavy mic stutter. A generous
+                // latency lets late buffers land instead. (`vol` = mic mute
+                // hook, `agate` = pause hook, both driven by the controller.)
+                (Some(mic), Some(monitor)) => {
+                    let device =
+                        if mic == "default" { String::new() } else { format!(" device={mic}") };
+                    let dsp = mic_dsp(opts.voice_process);
+                    // Every mixer pad and its output carry these exact caps.
+                    // With one branch's format pinned (webrtcdsp) and the
+                    // other free, whichever pad negotiates first decides the
+                    // mixer format and the loser's push can land mid-
+                    // renegotiation and die with not-negotiated — the
+                    // startup race behind "Internal data stream error".
+                    // Identical pinned caps everywhere make negotiation
+                    // order irrelevant.
+                    const ACAPS: &str = "audio/x-raw,rate=48000,channels=1,format=S16LE";
+                    line += &format!(
+                        "audiomixer name=amix min-upstream-latency=700000000 ! {ACAPS} \
+                         ! audioconvert ! audioresample \
+                         ! identity name=agate ! {aac} bitrate=128000 ! aacparse ! {AQ} ! mux. "
+                    );
+                    line += &format!(
+                        "pulsesrc{device} ! {AQ} ! audioconvert ! audioresample \
+                         {dsp}! audioconvert ! audioresample ! {ACAPS} \
+                         ! volume name=vol ! amix. "
+                    );
+                    line += &format!(
+                        "pulsesrc device={monitor} ! {AQ} ! audioconvert ! audioresample \
+                         ! {ACAPS} ! amix. "
+                    );
+                }
+                // Single source: no mixer at all — a straight chain has no
+                // output timeline to fall behind, so nothing gets dropped.
+                (mic, monitor) => {
+                    let (device, dsp) = match mic {
+                        Some(m) => (
+                            if m == "default" { String::new() } else { format!(" device={m}") },
+                            mic_dsp(opts.voice_process),
+                        ),
+                        // Monitor-only: `vol` then mutes system audio, which
+                        // is the closest thing the mute button can mean here.
+                        None => (
+                            format!(" device={}", monitor.as_deref().unwrap_or_default()),
+                            "",
+                        ),
+                    };
+                    line += &format!(
+                        "pulsesrc{device} ! {AQ} ! audioconvert ! audioresample \
+                         {dsp}! volume name=vol ! identity name=agate \
+                         ! {aac} bitrate=128000 ! aacparse ! {AQ} ! mux. "
+                    );
+                }
             }
         } else {
             eprintln!(
