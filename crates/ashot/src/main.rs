@@ -83,6 +83,10 @@ enum Command {
         /// Crop region in stream pixels: X,Y,W,H
         #[arg(long, value_name = "X,Y,W,H")]
         region: Option<String>,
+        /// Record microphone audio: bare --mic = default input, or a source
+        /// name from `pactl list sources short`.
+        #[arg(long, value_name = "DEVICE", num_args = 0..=1, default_missing_value = "default")]
+        mic: Option<String>,
     },
     /// One-time interactive grant of the screenshot permission (run as a human).
     Setup,
@@ -104,8 +108,8 @@ fn main() {
         Command::Annotate { input, spec, output, clipboard, keep_spec } => {
             cmd_annotate(input, spec, output, clipboard, keep_spec)
         }
-        Command::Record { output, resolution, duration, region } => {
-            cmd_record(output, resolution, duration, region)
+        Command::Record { output, resolution, duration, region, mic } => {
+            cmd_record(output, resolution, duration, region, mic)
         }
         Command::Setup => cmd_setup(),
         Command::Monitors => cmd_monitors(),
@@ -217,6 +221,7 @@ fn cmd_record(
     resolution: Option<u32>,
     duration: Option<u64>,
     region: Option<String>,
+    mic: Option<String>,
 ) -> anyhow::Result<()> {
     use std::sync::atomic::Ordering;
 
@@ -235,7 +240,7 @@ fn cmd_record(
         None => None,
     };
 
-    let recording = ashot_record_start(ashot_core_opts(output, resolution, crop))?;
+    let recording = ashot_record_start(ashot_core_opts(output, resolution, crop, mic))?;
     eprintln!(
         "{}",
         json!({
@@ -291,8 +296,9 @@ fn ashot_core_opts(
     output: Option<PathBuf>,
     resolution: Option<u32>,
     crop: Option<(u32, u32, u32, u32)>,
+    mic: Option<String>,
 ) -> ashot_core::record::RecordOptions {
-    ashot_core::record::RecordOptions { output, height: resolution, crop }
+    ashot_core::record::RecordOptions { output, height: resolution, crop, mic }
 }
 
 fn ashot_record_start(

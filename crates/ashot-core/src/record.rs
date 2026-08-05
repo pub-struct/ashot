@@ -36,6 +36,9 @@ pub struct RecordOptions {
     pub height: Option<u32>,
     /// Crop region in stream pixels (x, y, w, h), applied before scaling.
     pub crop: Option<(u32, u32, u32, u32)>,
+    /// Microphone: None = no audio, Some("default") = default input,
+    /// Some(name) = a specific PulseAudio/PipeWire source name.
+    pub mic: Option<String>,
 }
 
 pub struct Recording {
@@ -45,6 +48,7 @@ pub struct Recording {
     pub encoder: &'static str,
     pub out_width: u32,
     pub out_height: u32,
+    pub has_audio: bool,
     started: Instant,
 }
 
@@ -103,7 +107,7 @@ pub fn start_recording(opts: RecordOptions) -> Result<Recording> {
             let (keeper2, stream2) = open_portal_stream()?;
             let (enc, child2) =
                 spawn_gst(&stream2, &opts, &path, out_w, out_h, bitrate, "x264enc")?;
-            return finish_start(keeper2, child2, enc, path, out_w, out_h);
+            return finish_start(keeper2, child2, enc, path, out_w, out_h, opts.mic.is_some());
         }
         Ok(Some(status)) => {
             return Err(Error::Record(format!("encoder exited at startup: {status}")));
@@ -111,7 +115,7 @@ pub fn start_recording(opts: RecordOptions) -> Result<Recording> {
         _ => (encoder, child),
     };
 
-    finish_start(keeper, child, encoder, path, out_w, out_h)
+    finish_start(keeper, child, encoder, path, out_w, out_h, opts.mic.is_some())
 }
 
 fn finish_start(
@@ -121,6 +125,7 @@ fn finish_start(
     path: PathBuf,
     out_width: u32,
     out_height: u32,
+    has_audio: bool,
 ) -> Result<Recording> {
     Ok(Recording {
         child,
@@ -129,6 +134,7 @@ fn finish_start(
         encoder,
         out_width,
         out_height,
+        has_audio,
         started: Instant::now(),
     })
 }
@@ -278,8 +284,26 @@ fn spawn_gst(
              ! h264parse "
         );
     }
-    line += &format!("! mp4mux ! filesink location={}", shell_safe(path)?);
+    line += "! mux. ";
+    line += &format!("mp4mux name=mux ! filesink location={} ", shell_safe(path)?);
+    if let Some(mic) = &opts.mic {
+        if let Some(aac) = ["avenc_aac", "voaacenc"].iter().find(|e| gst_has_element(e)) {
+            let device = if mic == "default" { String::new() } else { format!(" device={mic}") };
+            line += &format!(
+                "pulsesrc{device} ! queue ! audioconvert ! audioresample \
+                 ! {aac} bitrate=128000 ! aacparse ! mux. "
+            );
+        } else {
+            eprintln!(
+                "{}",
+                serde_json::json!({ "warning": "no AAC encoder found; recording without audio" })
+            );
+        }
+    }
 
+    if std::env::var_os("ASHOT_DEBUG").is_some() {
+        eprintln!("[ashot debug] pipeline: {line}");
+    }
     let mut args: Vec<String> = vec!["-e".into(), "-q".into()];
     args.extend(split_launch_line(&line));
 
@@ -320,6 +344,31 @@ fn shell_safe(path: &std::path::Path) -> Result<String> {
 
 fn even(v: u32) -> u32 {
     (v.max(2)) & !1
+}
+
+/// Microphones (non-monitor PulseAudio/PipeWire sources): (name, description).
+/// Best-effort — returns empty if pactl is unavailable.
+pub fn list_microphones() -> Vec<(String, String)> {
+    let output = Command::new("pactl")
+        .args(["--format=json", "list", "sources"])
+        .output();
+    let Ok(output) = output else { return Vec::new() };
+    let Ok(sources) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return Vec::new();
+    };
+    sources
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            let name = s.get("name")?.as_str()?;
+            if name.ends_with(".monitor") {
+                return None;
+            }
+            let desc = s.get("description").and_then(|d| d.as_str()).unwrap_or(name);
+            Some((name.to_string(), desc.to_string()))
+        })
+        .collect()
 }
 
 pub fn gst_has_element(name: &str) -> bool {

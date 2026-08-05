@@ -23,14 +23,14 @@ use crate::{editor, img::to_render_image, theme};
 const DISMISS_AFTER: Duration = Duration::from_secs(6);
 
 /// What a completed selection does.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum Purpose {
     Screenshot,
-    Record { height: u32 },
+    Record { height: u32, mic: Option<String> },
 }
 
 /// How the overlay starts.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum OverlayStart {
     /// Drag-select for the given purpose.
     Select(Purpose),
@@ -160,6 +160,7 @@ impl OverlayView {
         &mut self,
         selection: Option<(Pixels, Pixels, Pixels, Pixels)>,
         height: u32,
+        mic: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -168,7 +169,7 @@ impl OverlayView {
             (x.max(0) as u32, y.max(0) as u32, w, h)
         });
         window.remove_window();
-        crate::launcher::start_recording_flow(crop, Some(height), cx);
+        crate::launcher::start_recording_flow(crop, Some(height), mic, cx);
     }
 
     /// Capture → clipboard → preview card, in one step.
@@ -387,9 +388,11 @@ impl Render for OverlayView {
                     (_, "escape") => cx.quit(),
                     (Phase::Preview, "enter") | (Phase::Preview, "s") => this.save(cx),
                     (Phase::Preview, "e") => this.edit(window, cx),
-                    (Phase::Idle, "enter") => match this.purpose {
+                    (Phase::Idle, "enter") => match this.purpose.clone() {
                         Purpose::Screenshot => this.enter_preview(None, window, cx),
-                        Purpose::Record { height } => this.start_record(None, height, window, cx),
+                        Purpose::Record { height, mic } => {
+                            this.start_record(None, height, mic, window, cx)
+                        }
                     },
                     _ => {}
                 }
@@ -425,12 +428,12 @@ impl Render for OverlayView {
                     cx.listener(|this, ev: &MouseUpEvent, window, cx| {
                         if this.phase == Phase::Dragging {
                             this.end = ev.position;
-                            match (this.selection(), this.purpose) {
+                            match (this.selection(), this.purpose.clone()) {
                                 (Some(sel), Purpose::Screenshot) => {
                                     this.enter_preview(Some(sel), window, cx)
                                 }
-                                (Some(sel), Purpose::Record { height }) => {
-                                    this.start_record(Some(sel), height, window, cx)
+                                (Some(sel), Purpose::Record { height, mic }) => {
+                                    this.start_record(Some(sel), height, mic, window, cx)
                                 }
                                 (None, _) => {
                                     this.phase = Phase::Idle;

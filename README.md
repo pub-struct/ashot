@@ -55,13 +55,16 @@ ashot record --duration 10             # full screen -> ~/Videos/Screencasts/rec
 ashot record -o demo.mp4               # record until Ctrl+C
 ashot record --resolution 720          # scale to 720p/1080p/1440p on the GPU
 ashot record --region 100,100,1280,720 # crop a region (stream pixels)
+ashot record --mic                     # + default microphone (AAC audio track)
+ashot record --mic alsa_input.usb-...  # a specific source (pactl list sources short)
 
 # Introspection
 ashot monitors                         # monitor layout as JSON
 
 # Desktop app (GPUI)
-ashot ui                               # floating toolbar: Screenshot/Record ×
-                                        #   Full/Region (+ resolution for record)
+ashot ui                               # floating pill toolbar: Screenshot/Record,
+                                        #   Full/Crop, resolution + mic (record),
+                                        #   one red button to fire
 ashot ui image.png                     # open the annotation editor on a PNG
 ```
 

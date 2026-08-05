@@ -112,10 +112,16 @@ Rust with GPUI (Zed's UI framework).
 - **Portal session lifetime**: held by a keeper thread for the whole
   recording; `Recording` Drop SIGINTs the encoder as an orphan guard, and the
   recorder window's ✕ routes through Stop.
-- **UI**: `ashot ui` = launcher toolbar (Screenshot/Record × Full/Region,
-  resolution segmented control); region select reuses the freeze-frame overlay
-  (Purpose::Record); recording shows a small movable status window (elapsed,
-  GPU/CPU badge, Stop).
+- **UI**: `ashot ui` = floating pill toolbar (user-sketched): mode toggle,
+  Full/Crop selector, resolution + mic picker in record mode, one red action
+  button. Transparent window → true pill shape. Region select reuses the
+  freeze-frame overlay (Purpose::Record); recording shows a small movable
+  status window (elapsed, GPU/CPU badge, Stop).
+- **Mic audio**: optional pulsesrc → avenc_aac 128k branch into the same
+  mp4mux. Device list from `pactl --format=json list sources` (monitors
+  filtered out); default is no mic. Note: mp4mux silently omits a track that
+  never produced samples (e.g. a sleeping bluetooth source) — picking an
+  explicit device avoids it.
 
 ## Known risks / later
 - GPUI git-dep breakage on rev bumps (mitigated by pinning + crate isolation).
