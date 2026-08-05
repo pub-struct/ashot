@@ -4,10 +4,12 @@
 //! decisions this implements.
 
 pub mod capture;
+pub mod captions;
 pub mod clipboard;
 pub mod error;
 pub mod paths;
 pub mod record;
+pub mod video;
 pub mod render;
 pub mod spec;
 

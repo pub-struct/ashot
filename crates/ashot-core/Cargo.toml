@@ -18,3 +18,5 @@ dirs.workspace = true
 chrono.workspace = true
 wl-clipboard-rs.workspace = true
 libc.workspace = true
+whisper-rs.workspace = true
+hound.workspace = true

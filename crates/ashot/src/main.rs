@@ -91,6 +91,31 @@ enum Command {
         #[arg(long)]
         system_audio: bool,
     },
+    /// Generate English captions (SRT) with AI (whisper base.en).
+    Captions {
+        /// Input video/audio file.
+        input: PathBuf,
+        /// Output SRT path. Default: <input>.srt
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Export an edited video: cuts, smooth zooms, caption burn (GPU pipeline).
+    Export {
+        /// Input video.
+        input: PathBuf,
+        /// Output path. Default: <input>-edited.mp4
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Ranges to keep, seconds: "0-3.5,6-12". Default: everything.
+        #[arg(long, value_name = "S-E,...")]
+        keep: Option<String>,
+        /// Zoom points "T:CX:CY:LEVEL:DURATION" (repeatable), source pixels.
+        #[arg(long, value_name = "T:CX:CY:L:D")]
+        zoom: Vec<String>,
+        /// Burn this SRT into the video.
+        #[arg(long)]
+        srt: Option<PathBuf>,
+    },
     /// One-time interactive grant of the screenshot permission (run as a human).
     Setup,
     /// List monitors as JSON (pick indices for `capture --monitor`).
@@ -113,6 +138,10 @@ fn main() {
         }
         Command::Record { output, resolution, duration, region, mic, system_audio } => {
             cmd_record(output, resolution, duration, region, mic, system_audio)
+        }
+        Command::Captions { input, output } => cmd_captions(input, output),
+        Command::Export { input, output, keep, zoom, srt } => {
+            cmd_export(input, output, keep, zoom, srt)
         }
         Command::Setup => cmd_setup(),
         Command::Monitors => cmd_monitors(),
@@ -210,6 +239,80 @@ fn cmd_annotate(
         "annotations": spec.len(),
         "clipboard": clipboard,
     }), &dest);
+    Ok(())
+}
+
+fn cmd_captions(input: PathBuf, output: Option<PathBuf>) -> anyhow::Result<()> {
+    let srt = output.unwrap_or_else(|| input.with_extension("srt"));
+    ashot_core::captions::generate(&input, &srt, |status| {
+        eprintln!("{}", json!({ "status": status }));
+    })?;
+    println!(
+        "{}",
+        json!({ "ok": true, "action": "captions", "path": srt.display().to_string() })
+    );
+    Ok(())
+}
+
+fn cmd_export(
+    input: PathBuf,
+    output: Option<PathBuf>,
+    keep: Option<String>,
+    zoom: Vec<String>,
+    srt: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let output = output.unwrap_or_else(|| {
+        let stem = input.file_stem().unwrap_or_default().to_string_lossy();
+        input.with_file_name(format!("{stem}-edited.mp4"))
+    });
+    let keep = match keep {
+        None => Vec::new(),
+        Some(spec) => spec
+            .split(',')
+            .map(|range| {
+                let (s, e) = range
+                    .split_once('-')
+                    .ok_or_else(|| anyhow::anyhow!("bad range {range:?}, expected S-E"))?;
+                Ok::<_, anyhow::Error>((s.trim().parse::<f64>()?, e.trim().parse::<f64>()?))
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    let zooms = zoom
+        .iter()
+        .map(|z| {
+            let parts: Vec<&str> = z.split(':').collect();
+            anyhow::ensure!(parts.len() == 5, "bad zoom {z:?}, expected T:CX:CY:LEVEL:DUR");
+            Ok(ashot_core::video::ZoomPoint {
+                t: parts[0].parse()?,
+                cx: parts[1].parse()?,
+                cy: parts[2].parse()?,
+                level: parts[3].parse()?,
+                duration: parts[4].parse()?,
+            })
+        })
+        .collect::<Result<Vec<_>, anyhow::Error>>()?;
+
+    let spec = ashot_core::video::ExportSpec {
+        input,
+        output,
+        keep,
+        zooms,
+        overlay_png: None,
+        srt,
+    };
+    let path = ashot_core::video::export(&spec, |p| {
+        eprintln!("{}", json!({ "progress": (p * 100.0).round() / 100.0 }));
+    })?;
+    let info = ashot_core::video::probe(&path)?;
+    println!(
+        "{}",
+        json!({
+            "ok": true, "action": "export",
+            "path": path.display().to_string(),
+            "duration_s": (info.duration_s * 10.0).round() / 10.0,
+            "width": info.width, "height": info.height,
+        })
+    );
     Ok(())
 }
 

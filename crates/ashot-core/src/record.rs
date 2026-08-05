@@ -275,7 +275,7 @@ fn finish_start(
         paused: false,
         muted: false,
         accumulated: Duration::ZERO,
-        segment_start: Instant::now(),
+        segment_start: started,
     })
 }
 

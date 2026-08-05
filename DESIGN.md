@@ -136,6 +136,23 @@ Rust with GPUI (Zed's UI framework).
 - **Recorder pill** (user-sketched): [● time] [🎤 mute] [⏸ pause] [■ Stop]
   [⣿ grab → start_window_move]; Space = pause, M = mute, Esc/Enter = stop.
 
+## Video editing (added 2026-08-05)
+- **Single-pass export**: one GPU pipeline (`vah264dec` → `videocrop` (meta)
+  → `vapostproc` → optional CPU overlay/subtitles → `vah264enc`). Cuts are an
+  edit list applied by a pad probe: out-of-range buffers dropped, kept
+  buffers' PTS compressed by removed time. No seeks — mp4mux cannot survive a
+  flush-seek after preroll (found empirically: 0-byte moov-less files).
+- **Zoom**: per-frame crop rect from smoothstep-eased zoom points, applied as
+  crop metadata on the GPU by vapostproc; native pixels, no upscale loss at
+  level ≤ source/output ratio.
+- **Frames for the UI**: python helper seeks + pulls one RGBA frame via
+  appsink (~200 ms); debounced by generation counter while scrubbing.
+- **Captions**: whisper-rs (whisper.cpp) base.en; wav via gst decodebin;
+  model cached in ~/.cache/ashot/models. CPU now; `vulkan` feature ready.
+- **Editor UI**: toolbar (play/cut/zoom+levels/tools/colors/CC/export),
+  preview with the same annotation tools, timeline with cut ranges, zoom
+  markers, playhead scrubbing. Export progress via shared-state ticker.
+
 ## Known risks / later
 - GPUI git-dep breakage on rev bumps (mitigated by pinning + crate isolation).
 - Global hotkeys on GNOME Wayland need the GlobalShortcuts portal (M2 concern).

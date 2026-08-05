@@ -59,6 +59,13 @@ ashot record --mic                     # + default microphone (AAC audio track)
 ashot record --mic alsa_input.usb-...  # a specific source (pactl list sources short)
 ashot record --system-audio            # + what you hear (default output's monitor)
 
+# Video editing (GPU decode → edit → GPU encode)
+ashot ui rec.mp4                       # video editor: scrub, cut, draw, zoom, captions
+ashot export rec.mp4 --keep 0-3,5-9    # cut: keep only these ranges
+ashot export rec.mp4 --zoom 4:960:540:2:3   # smooth 2x zoom at t=4s for 3s
+ashot export rec.mp4 --srt rec.srt     # burn captions
+ashot captions rec.mp4                 # AI captions (whisper base.en) -> rec.srt
+
 # Introspection
 ashot monitors                         # monitor layout as JSON
 
@@ -95,6 +102,20 @@ arrow, numbered marker, text. Seven colors, S/M/L stroke. **Ctrl+Z** undo,
 **Ctrl+C** copy, **Ctrl+S** save, **Esc** quit. Text tool: click, type,
 **Enter** commits. Saving burns annotations through the same core renderer the
 CLI uses, so human and agent output are pixel-identical.
+
+### Video editor
+
+`ashot ui video.mp4`: scrub or play the timeline, **✂ Cut** twice to remove a
+range, draw with the same five tools, **🔍 Zoom** + click to add a smooth
+zoom point (eases in/out; rendered from native pixels on the GPU), **CC** to
+generate AI captions and burn them, **Export** for the final MP4. Cuts,
+zooms, overlays and captions all render in a single GPU pass
+(`vah264dec` → crop/scale on GPU → `vah264enc`).
+
+Captions run whisper.cpp (base.en, auto-downloaded ~148 MB) on CPU; install
+`libvulkan-dev` + `glslc` and rebuild with the whisper `vulkan` feature for
+GPU inference. Mouse-gesture auto-zoom is planned via the portal's cursor
+metadata (Wayland forbids reading the global pointer directly).
 
 ## Annotation spec
 
