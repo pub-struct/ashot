@@ -115,6 +115,9 @@ enum Command {
         /// Burn this SRT into the video.
         #[arg(long)]
         srt: Option<PathBuf>,
+        /// Composite this RGBA PNG (source resolution) over every frame.
+        #[arg(long)]
+        overlay: Option<PathBuf>,
     },
     /// One-time interactive grant of the screenshot permission (run as a human).
     Setup,
@@ -140,8 +143,8 @@ fn main() {
             cmd_record(output, resolution, duration, region, mic, system_audio)
         }
         Command::Captions { input, output } => cmd_captions(input, output),
-        Command::Export { input, output, keep, zoom, srt } => {
-            cmd_export(input, output, keep, zoom, srt)
+        Command::Export { input, output, keep, zoom, srt, overlay } => {
+            cmd_export(input, output, keep, zoom, srt, overlay)
         }
         Command::Setup => cmd_setup(),
         Command::Monitors => cmd_monitors(),
@@ -260,6 +263,7 @@ fn cmd_export(
     keep: Option<String>,
     zoom: Vec<String>,
     srt: Option<PathBuf>,
+    overlay: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let output = output.unwrap_or_else(|| {
         let stem = input.file_stem().unwrap_or_default().to_string_lossy();
@@ -297,7 +301,7 @@ fn cmd_export(
         output,
         keep,
         zooms,
-        overlay_png: None,
+        overlay_png: overlay,
         srt,
     };
     let path = ashot_core::video::export(&spec, |p| {

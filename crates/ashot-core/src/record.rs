@@ -485,9 +485,19 @@ fn spawn_gst(
             if let Some(mic) = &opts.mic {
                 let device =
                     if mic == "default" { String::new() } else { format!(" device={mic}") };
+                // Voice processing fixes raw-mic capture: AGC evens out quiet
+                // and hot mics (with a limiter against clipping) and noise
+                // suppression cleans the floor. Fallback: plain chain.
+                let dsp = if gst_has_element("webrtcdsp") {
+                    "! audio/x-raw,rate=48000,channels=1,format=S16LE \
+                     ! webrtcdsp echo-cancel=false noise-suppression=true gain-control=true \
+                     ! audioconvert "
+                } else {
+                    ""
+                };
                 line += &format!(
                     "pulsesrc{device} ! queue ! audioconvert ! audioresample \
-                     ! volume name=vol ! amix. "
+                     {dsp}! volume name=vol ! amix. "
                 );
             }
             if let Some(monitor) = &system_monitor {

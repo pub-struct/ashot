@@ -135,15 +135,22 @@ bitrate = spec['bitrate']
 
 post = ''
 if overlay or srt:
-    post += '! videoconvert ! video/x-raw,format=NV12 '
+    # Let videoconvert negotiate whatever the overlay elements support,
+    # then hand the encoder NV12 explicitly.
+    post += '! videoconvert '
     if overlay:
         post += f'! gdkpixbufoverlay location="{overlay}" overlay-width={W} overlay-height={H} '
     if srt:
         post += '! subtitleoverlay name=subover font-desc="Sans, 24" '
+    post += '! videoconvert ! video/x-raw,format=NV12 '
 
 if spec['gpu']:
     decode = '! h264parse ! vah264dec '
-    scale = f'! vapostproc ! video/x-raw(memory:VAMemory),format=NV12,width={W},height={H} '
+    if overlay or srt:
+        # CPU compositing ahead: vapostproc downloads to system memory here.
+        scale = f'! vapostproc ! video/x-raw,width={W},height={H} '
+    else:
+        scale = f'! vapostproc ! video/x-raw(memory:VAMemory),format=NV12,width={W},height={H} '
     encode = f'! vah264enc bitrate={bitrate} ! h264parse '
 else:
     decode = '! h264parse ! avdec_h264 '
@@ -151,13 +158,15 @@ else:
     encode = f'! x264enc bitrate={bitrate} speed-preset=veryfast ! h264parse '
 
 desc = (f'filesrc location="{inp}" ! qtdemux name=d '
-        f'd.video_0 {decode}! videocrop name=zc {scale}{post}{encode}'
-        f'! mp4mux name=m ! filesink location="{out}" ')
+        f'd.video_0 ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=100000000 '
+        f'{decode}! videocrop name=zc {scale}{post}{encode}'
+        f'! queue ! mp4mux name=m ! filesink location="{out}" ')
 if srt:
     desc += f'filesrc location="{srt}" ! subparse ! subover.subtitle_sink '
 if spec['has_audio']:
-    desc += ('d.audio_0 ! queue ! aacparse ! avdec_aac ! audioconvert ! audioresample '
-             '! identity name=agate ! avenc_aac bitrate=128000 ! aacparse ! m. ')
+    desc += ('d.audio_0 ! queue max-size-buffers=0 max-size-time=0 max-size-bytes=100000000 '
+             '! aacparse ! avdec_aac ! audioconvert ! audioresample '
+             '! identity name=agate ! avenc_aac bitrate=128000 ! aacparse ! queue ! m. ')
 
 pipeline = Gst.parse_launch(desc)
 last_progress = [0.0]
