@@ -50,14 +50,30 @@ ashot annotate in.png --spec @spec.json     # spec from file
 echo "$SPEC" | ashot annotate in.png --spec -  # spec from stdin
 ashot annotate in.png --spec SPEC --keep-spec  # writes out.png.shot.json sidecar
 
+# Screen recording (GPU-encoded H.264 via VA-API; CPU x264 fallback)
+ashot record --duration 10             # full screen -> ~/Videos/Screencasts/rec-<ts>.mp4
+ashot record -o demo.mp4               # record until Ctrl+C
+ashot record --resolution 720          # scale to 720p/1080p/1440p on the GPU
+ashot record --region 100,100,1280,720 # crop a region (stream pixels)
+
 # Introspection
 ashot monitors                         # monitor layout as JSON
 
 # Desktop app (GPUI)
-ashot ui                               # freeze-frame overlay: drag to select,
-                                        #   then Save / Copy / Edit / Cancel
+ashot ui                               # floating toolbar: Screenshot/Record ×
+                                        #   Full/Region (+ resolution for record)
 ashot ui image.png                     # open the annotation editor on a PNG
 ```
+
+### Recording architecture
+
+Frames come from the compositor via the ScreenCast portal as **DMA-BUF (GPU
+memory)** into PipeWire; `vapostproc` converts/scales on the GPU and
+`vah264enc` uses the GPU's hardware encoder — the CPU never touches pixels.
+Encoding runs in a `gst-launch-1.0 -e` subprocess (stock GStreamer, no extra
+packages on most distros). The first recording shows the system source-picker
+once; the portal restore token is persisted (`~/.config/ashot/`) so later
+recordings — including agent-driven ones — start silently.
 
 ### Overlay shortcuts
 Drag to select · **Enter** save (selection or full screen) · **C** copy ·

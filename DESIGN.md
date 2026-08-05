@@ -97,6 +97,26 @@ Rust with GPUI (Zed's UI framework).
   Rationale + measurements in `crates/ashot-core/examples/pipeline_bench.rs`
   (per-event burn was 9–115 ms; the backlog caused freeze-then-snap dragging).
 
+## Recording (added 2026-08-05)
+- **Path**: ScreenCast portal (ashpd) → PipeWire node + fd → `gst-launch-1.0 -e`
+  subprocess. No GStreamer linkage; `-e` maps SIGINT → EOS → finalized MP4.
+- **GPU pipeline**: `pipewiresrc ! queue ! [videocrop] ! vapostproc !
+  NV12/VAMemory caps ! vah264enc ! h264parse ! mp4mux`. DMA-BUF in, hardware
+  encoder out; CPU never touches pixels. Auto-fallback to x264 (CPU) if the VA
+  pipeline dies at startup (~1.2 s health check, fresh portal stream).
+- **Resolutions**: 720p/1080p/1440p = GPU scaling in vapostproc; bitrates
+  6/10/16 Mbps; dimensions evened for NV12. Never upscales.
+- **Unattended**: PersistMode::ExplicitlyRevoked restore token persisted at
+  `~/.config/ashot/screencast.token` — first run shows the system picker,
+  every later run starts silently (agents included).
+- **Portal session lifetime**: held by a keeper thread for the whole
+  recording; `Recording` Drop SIGINTs the encoder as an orphan guard, and the
+  recorder window's ✕ routes through Stop.
+- **UI**: `ashot ui` = launcher toolbar (Screenshot/Record × Full/Region,
+  resolution segmented control); region select reuses the freeze-frame overlay
+  (Purpose::Record); recording shows a small movable status window (elapsed,
+  GPU/CPU badge, Stop).
+
 ## Known risks / later
 - GPUI git-dep breakage on rev bumps (mitigated by pinning + crate isolation).
 - Global hotkeys on GNOME Wayland need the GlobalShortcuts portal (M2 concern).

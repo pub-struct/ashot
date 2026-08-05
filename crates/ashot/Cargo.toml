@@ -16,3 +16,4 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tiny-skia.workspace = true
+libc.workspace = true

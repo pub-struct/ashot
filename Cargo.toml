@@ -24,6 +24,7 @@ dirs = "5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 wl-clipboard-rs = "0.9"
 anyhow = "1"
+libc = "0.2"
 # Pinned rev per DESIGN.md: GPUI is a git dep with API churn; bump deliberately.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "6153542cf6e375c8ce45ae97eec67ec1b75b8aa5" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "6153542cf6e375c8ce45ae97eec67ec1b75b8aa5", features = ["wayland", "x11"] }

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    div, img, prelude::*, px, App, Application, Bounds, Context, CursorStyle, FocusHandle,
+    div, img, prelude::*, px, App, Bounds, Context, CursorStyle, FocusHandle,
     Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     Point, RenderImage, Window, WindowBounds, WindowOptions,
 };
@@ -22,33 +22,45 @@ use crate::{editor, img::to_render_image, theme};
 /// How long the preview card lingers before self-dismissing (unless hovered).
 const DISMISS_AFTER: Duration = Duration::from_secs(6);
 
-pub fn run(pixmap: Pixmap) -> anyhow::Result<()> {
-    Application::with_platform(gpui_platform::current_platform(false)).run(move |cx: &mut App| {
-        let display_bounds = cx
-            .primary_display()
-            .map(|d| d.bounds())
-            .unwrap_or_else(|| Bounds::from_corners(Point::default(), Point::new(px(1920.), px(1080.))));
-        let window = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Fullscreen(display_bounds)),
-                titlebar: None,
-                is_movable: false,
-                ..Default::default()
-            },
-            |window, cx| {
-                let view = cx.new(|cx| OverlayView::new(pixmap, cx));
-                let handle = view.read(cx).focus_handle.clone();
-                window.focus(&handle, cx);
-                view
-            },
-        );
-        if window.is_err() {
-            eprintln!("failed to open overlay window");
-            cx.quit();
-        }
-        cx.activate(true);
-    });
-    Ok(())
+/// What a completed selection does.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Purpose {
+    Screenshot,
+    Record { height: u32 },
+}
+
+/// How the overlay starts.
+#[derive(Clone, Copy)]
+pub enum OverlayStart {
+    /// Drag-select for the given purpose.
+    Select(Purpose),
+    /// Jump straight to the preview card with the full frame (already copied).
+    PreviewFull,
+}
+
+pub fn open_window(pixmap: Pixmap, start: OverlayStart, cx: &mut App) {
+    let display_bounds = cx
+        .primary_display()
+        .map(|d| d.bounds())
+        .unwrap_or_else(|| Bounds::from_corners(Point::default(), Point::new(px(1920.), px(1080.))));
+    let window = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Fullscreen(display_bounds)),
+            titlebar: None,
+            is_movable: false,
+            ..Default::default()
+        },
+        |window, cx| {
+            let view = cx.new(|cx| OverlayView::new(pixmap, start, cx));
+            let handle = view.read(cx).focus_handle.clone();
+            window.focus(&handle, cx);
+            view
+        },
+    );
+    if window.is_err() {
+        eprintln!("failed to open overlay window");
+        cx.quit();
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -74,11 +86,17 @@ struct OverlayView {
     preview: Option<PreviewState>,
     preview_hovered: bool,
     dismiss_gen: usize,
+    purpose: Purpose,
+    start_preview_full: bool,
 }
 
 impl OverlayView {
-    fn new(pixmap: Pixmap, cx: &mut Context<Self>) -> Self {
+    fn new(pixmap: Pixmap, start: OverlayStart, cx: &mut Context<Self>) -> Self {
         let image = to_render_image(&pixmap);
+        let (purpose, start_preview_full) = match start {
+            OverlayStart::Select(purpose) => (purpose, false),
+            OverlayStart::PreviewFull => (Purpose::Screenshot, true),
+        };
         Self {
             base: Arc::new(pixmap),
             image,
@@ -89,6 +107,8 @@ impl OverlayView {
             preview: None,
             preview_hovered: false,
             dismiss_gen: 0,
+            purpose,
+            start_preview_full,
         }
     }
 
@@ -106,14 +126,12 @@ impl OverlayView {
         Some((x0, y0, x1 - x0, y1 - y0))
     }
 
-    fn crop_to(
+    /// Window-space selection → image/stream pixel rect.
+    fn selection_to_image(
         &self,
         window: &Window,
-        selection: Option<(Pixels, Pixels, Pixels, Pixels)>,
-    ) -> anyhow::Result<Pixmap> {
-        let Some((x, y, w, h)) = selection else {
-            return Ok((*self.base).clone());
-        };
+        (x, y, w, h): (Pixels, Pixels, Pixels, Pixels),
+    ) -> (i32, i32, u32, u32) {
         let viewport = window.viewport_size();
         let sx = self.base.width() as f32 / f32::from(viewport.width);
         let sy = self.base.height() as f32 / f32::from(viewport.height);
@@ -121,7 +139,36 @@ impl OverlayView {
         let iy = (f32::from(y) * sy).round().max(0.0) as i32;
         let iw = ((f32::from(w) * sx).round() as u32).clamp(1, self.base.width() - ix as u32);
         let ih = ((f32::from(h) * sy).round() as u32).clamp(1, self.base.height() - iy as u32);
+        (ix, iy, iw, ih)
+    }
+
+    fn crop_to(
+        &self,
+        window: &Window,
+        selection: Option<(Pixels, Pixels, Pixels, Pixels)>,
+    ) -> anyhow::Result<Pixmap> {
+        let Some(sel) = selection else {
+            return Ok((*self.base).clone());
+        };
+        let (ix, iy, iw, ih) = self.selection_to_image(window, sel);
         Ok(ashot_core::render::crop(&self.base, ix, iy, iw, ih)?)
+    }
+
+    /// Record purpose: hand the region to the recording flow and get out of
+    /// the way (the overlay must not be on screen while recording).
+    fn start_record(
+        &mut self,
+        selection: Option<(Pixels, Pixels, Pixels, Pixels)>,
+        height: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let crop = selection.map(|sel| {
+            let (x, y, w, h) = self.selection_to_image(window, sel);
+            (x.max(0) as u32, y.max(0) as u32, w, h)
+        });
+        window.remove_window();
+        crate::launcher::start_recording_flow(crop, Some(height), cx);
     }
 
     /// Capture → clipboard → preview card, in one step.
@@ -311,6 +358,10 @@ impl Render for OverlayView {
         // Hidden test hook: ASHOT_TEST_PREVIEW=1 jumps straight to the
         // preview card with a fixed region, so the flow can be exercised
         // without input injection (used by automated visual checks).
+        if self.start_preview_full && self.phase == Phase::Idle {
+            self.start_preview_full = false;
+            self.enter_preview(None, window, cx);
+        }
         if self.phase == Phase::Idle && self.dismiss_gen == 0 {
             if let Some(val) = std::env::var_os("ASHOT_TEST_PREVIEW") {
                 self.enter_preview(Some((px(200.), px(150.), px(500.), px(300.))), window, cx);
@@ -336,7 +387,10 @@ impl Render for OverlayView {
                     (_, "escape") => cx.quit(),
                     (Phase::Preview, "enter") | (Phase::Preview, "s") => this.save(cx),
                     (Phase::Preview, "e") => this.edit(window, cx),
-                    (Phase::Idle, "enter") => this.enter_preview(None, window, cx),
+                    (Phase::Idle, "enter") => match this.purpose {
+                        Purpose::Screenshot => this.enter_preview(None, window, cx),
+                        Purpose::Record { height } => this.start_record(None, height, window, cx),
+                    },
                     _ => {}
                 }
             }))
@@ -371,9 +425,14 @@ impl Render for OverlayView {
                     cx.listener(|this, ev: &MouseUpEvent, window, cx| {
                         if this.phase == Phase::Dragging {
                             this.end = ev.position;
-                            match this.selection() {
-                                Some(sel) => this.enter_preview(Some(sel), window, cx),
-                                None => {
+                            match (this.selection(), this.purpose) {
+                                (Some(sel), Purpose::Screenshot) => {
+                                    this.enter_preview(Some(sel), window, cx)
+                                }
+                                (Some(sel), Purpose::Record { height }) => {
+                                    this.start_record(Some(sel), height, window, cx)
+                                }
+                                (None, _) => {
                                     this.phase = Phase::Idle;
                                     cx.notify();
                                 }
@@ -407,7 +466,14 @@ impl Render for OverlayView {
                             .shadow_lg()
                             .text_sm()
                             .text_color(theme::text_muted())
-                            .child("Drag to select · Enter full screen · Esc cancel"),
+                            .child(match self.purpose {
+                                Purpose::Screenshot => {
+                                    "Drag to select · Enter full screen · Esc cancel"
+                                }
+                                Purpose::Record { .. } => {
+                                    "Drag the area to record · Enter full screen · Esc cancel"
+                                }
+                            }),
                     );
                 }
                 Some((x, y, w, h)) => {

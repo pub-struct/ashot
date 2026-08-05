@@ -7,6 +7,7 @@ pub mod capture;
 pub mod clipboard;
 pub mod error;
 pub mod paths;
+pub mod record;
 pub mod render;
 pub mod spec;
 

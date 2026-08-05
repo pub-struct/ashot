@@ -69,6 +69,21 @@ enum Command {
         #[arg(long)]
         keep_spec: bool,
     },
+    /// Record the screen to MP4 (GPU-encoded via VA-API when available).
+    Record {
+        /// Output path. Default: ~/Videos/Screencasts/rec-<ts>.mp4
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Target height: 720, 1080 or 1440. Default: native.
+        #[arg(long, value_name = "720|1080|1440")]
+        resolution: Option<u32>,
+        /// Stop automatically after this many seconds (otherwise Ctrl+C).
+        #[arg(long, value_name = "SECS")]
+        duration: Option<u64>,
+        /// Crop region in stream pixels: X,Y,W,H
+        #[arg(long, value_name = "X,Y,W,H")]
+        region: Option<String>,
+    },
     /// One-time interactive grant of the screenshot permission (run as a human).
     Setup,
     /// List monitors as JSON (pick indices for `capture --monitor`).
@@ -89,11 +104,14 @@ fn main() {
         Command::Annotate { input, spec, output, clipboard, keep_spec } => {
             cmd_annotate(input, spec, output, clipboard, keep_spec)
         }
+        Command::Record { output, resolution, duration, region } => {
+            cmd_record(output, resolution, duration, region)
+        }
         Command::Setup => cmd_setup(),
         Command::Monitors => cmd_monitors(),
         Command::Ui { file } => ashot_app::run(match file {
             Some(path) => ashot_app::Mode::Editor(path),
-            None => ashot_app::Mode::Overlay,
+            None => ashot_app::Mode::Launcher,
         }),
     };
     if let Err(err) = result {
@@ -186,6 +204,101 @@ fn cmd_annotate(
         "clipboard": clipboard,
     }), &dest);
     Ok(())
+}
+
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_sigint(_: i32) {
+    STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn cmd_record(
+    output: Option<PathBuf>,
+    resolution: Option<u32>,
+    duration: Option<u64>,
+    region: Option<String>,
+) -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+
+    if let Some(res) = resolution {
+        anyhow::ensure!(
+            [720, 1080, 1440].contains(&res),
+            "resolution must be 720, 1080 or 1440"
+        );
+    }
+    let crop = match region {
+        Some(r) => {
+            let (x, y, w, h) = parse_region(&r)?;
+            anyhow::ensure!(x >= 0 && y >= 0, "region origin must be non-negative");
+            Some((x as u32, y as u32, w, h))
+        }
+        None => None,
+    };
+
+    let recording = ashot_record_start(ashot_core_opts(output, resolution, crop))?;
+    eprintln!(
+        "{}",
+        json!({
+            "recording": true,
+            "encoder": recording.encoder,
+            "width": recording.out_width,
+            "height": recording.out_height,
+            "path": recording.path.display().to_string(),
+            "stop": if duration.is_some() { "automatic" } else { "Ctrl+C" },
+        })
+    );
+
+    unsafe {
+        libc::signal(libc::SIGINT, on_sigint as usize);
+    }
+    let mut recording = recording;
+    let deadline = duration.map(|d| std::time::Instant::now() + std::time::Duration::from_secs(d));
+    loop {
+        if STOP_REQUESTED.load(Ordering::SeqCst) {
+            break;
+        }
+        if let Some(deadline) = deadline {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        if !recording.is_running() {
+            anyhow::bail!("encoder process exited unexpectedly");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+
+    let elapsed = recording.elapsed().as_secs_f64();
+    let encoder = recording.encoder;
+    let (w, h) = (recording.out_width, recording.out_height);
+    let path = recording.stop()?;
+    println!(
+        "{}",
+        json!({
+            "ok": true,
+            "action": "record",
+            "path": path.display().to_string(),
+            "encoder": encoder,
+            "width": w,
+            "height": h,
+            "duration_s": (elapsed * 10.0).round() / 10.0,
+        })
+    );
+    Ok(())
+}
+
+fn ashot_core_opts(
+    output: Option<PathBuf>,
+    resolution: Option<u32>,
+    crop: Option<(u32, u32, u32, u32)>,
+) -> ashot_core::record::RecordOptions {
+    ashot_core::record::RecordOptions { output, height: resolution, crop }
+}
+
+fn ashot_record_start(
+    opts: ashot_core::record::RecordOptions,
+) -> anyhow::Result<ashot_core::record::Recording> {
+    Ok(ashot_core::record::start_recording(opts)?)
 }
 
 fn cmd_setup() -> anyhow::Result<()> {

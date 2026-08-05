@@ -3,25 +3,23 @@
 
 pub mod editor;
 pub mod img;
+pub mod launcher;
 pub mod overlay;
+pub mod recorder;
 pub mod theme;
 
 use std::path::PathBuf;
 
 pub enum Mode {
-    /// Freeze-frame region selection over a fresh capture.
-    Overlay,
+    /// The floating toolbar: screenshot / record × full / crop.
+    Launcher,
     /// Open the annotation editor on an existing PNG.
     Editor(PathBuf),
 }
 
 pub fn run(mode: Mode) -> anyhow::Result<()> {
     match mode {
-        Mode::Overlay => {
-            // Capture BEFORE the app opens so our own window is not in shot.
-            let captured = ashot_core::capture::capture_full()?;
-            overlay::run(captured.pixmap)
-        }
+        Mode::Launcher => launcher::run(),
         Mode::Editor(path) => {
             let bytes = std::fs::read(&path)?;
             let pixmap = tiny_skia::Pixmap::decode_png(&bytes)

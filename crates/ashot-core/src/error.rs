@@ -20,6 +20,8 @@ pub enum Error {
     Image(String),
     #[error("clipboard copy failed: {0}")]
     Clipboard(String),
+    #[error("screen recording failed: {0}")]
+    Record(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -37,6 +39,7 @@ impl Error {
             Error::RegionOutOfBounds(..) => "region_out_of_bounds",
             Error::Image(_) => "image",
             Error::Clipboard(_) => "clipboard",
+            Error::Record(_) => "record",
             Error::Io(_) => "io",
         }
     }
