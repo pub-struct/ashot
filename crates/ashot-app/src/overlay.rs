@@ -23,10 +23,12 @@ use crate::{editor, img::to_render_image, theme};
 const DISMISS_AFTER: Duration = Duration::from_secs(6);
 
 /// What a completed selection does.
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub enum Purpose {
     Screenshot,
     Record { height: u32, mic: Option<String> },
+    /// Pick a region and return to the launcher pill with it.
+    PickRegion { state: crate::launcher::LauncherState },
 }
 
 /// How the overlay starts.
@@ -36,6 +38,8 @@ pub enum OverlayStart {
     Select(Purpose),
     /// Jump straight to the preview card with the full frame (already copied).
     PreviewFull,
+    /// Jump straight to the preview card with this image-pixel region.
+    PreviewRegion((u32, u32, u32, u32)),
 }
 
 pub fn open_window(pixmap: Pixmap, start: OverlayStart, cx: &mut App) {
@@ -87,15 +91,19 @@ struct OverlayView {
     preview_hovered: bool,
     dismiss_gen: usize,
     purpose: Purpose,
-    start_preview_full: bool,
+    /// Some(rect) = enter preview immediately (None rect = full frame).
+    start_preview: Option<Option<(i32, i32, u32, u32)>>,
 }
 
 impl OverlayView {
     fn new(pixmap: Pixmap, start: OverlayStart, cx: &mut Context<Self>) -> Self {
         let image = to_render_image(&pixmap);
-        let (purpose, start_preview_full) = match start {
-            OverlayStart::Select(purpose) => (purpose, false),
-            OverlayStart::PreviewFull => (Purpose::Screenshot, true),
+        let (purpose, start_preview) = match start {
+            OverlayStart::Select(purpose) => (purpose, None),
+            OverlayStart::PreviewFull => (Purpose::Screenshot, Some(None)),
+            OverlayStart::PreviewRegion((x, y, w, h)) => {
+                (Purpose::Screenshot, Some(Some((x as i32, y as i32, w, h))))
+            }
         };
         Self {
             base: Arc::new(pixmap),
@@ -108,7 +116,7 @@ impl OverlayView {
             preview_hovered: false,
             dismiss_gen: 0,
             purpose,
-            start_preview_full,
+            start_preview,
         }
     }
 
@@ -172,16 +180,29 @@ impl OverlayView {
         crate::launcher::start_recording_flow(crop, Some(height), mic, cx);
     }
 
-    /// Capture → clipboard → preview card, in one step.
+    /// Capture → clipboard → preview card, in one step (window-space input).
     fn enter_preview(
         &mut self,
         selection: Option<(Pixels, Pixels, Pixels, Pixels)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let pixmap = match self.crop_to(window, selection) {
-            Ok(p) => p,
-            Err(e) => return fail(e, cx),
+        let rect = selection.map(|sel| self.selection_to_image(window, sel));
+        self.enter_preview_rect(rect, cx);
+    }
+
+    /// Same, but the region is already in image pixels.
+    fn enter_preview_rect(
+        &mut self,
+        rect: Option<(i32, i32, u32, u32)>,
+        cx: &mut Context<Self>,
+    ) {
+        let pixmap = match rect {
+            None => (*self.base).clone(),
+            Some((x, y, w, h)) => match ashot_core::render::crop(&self.base, x, y, w, h) {
+                Ok(p) => p,
+                Err(e) => return fail(e.into(), cx),
+            },
         };
         let copy_result = pixmap
             .encode_png()
@@ -359,9 +380,10 @@ impl Render for OverlayView {
         // Hidden test hook: ASHOT_TEST_PREVIEW=1 jumps straight to the
         // preview card with a fixed region, so the flow can be exercised
         // without input injection (used by automated visual checks).
-        if self.start_preview_full && self.phase == Phase::Idle {
-            self.start_preview_full = false;
-            self.enter_preview(None, window, cx);
+        if let Some(rect) = self.start_preview.take() {
+            if self.phase == Phase::Idle {
+                self.enter_preview_rect(rect, cx);
+            }
         }
         if self.phase == Phase::Idle && self.dismiss_gen == 0 {
             if let Some(val) = std::env::var_os("ASHOT_TEST_PREVIEW") {
@@ -385,7 +407,17 @@ impl Render for OverlayView {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 match (this.phase, ev.keystroke.key.as_str()) {
-                    (_, "escape") => cx.quit(),
+                    (_, "escape") => {
+                        // Cancelling a region pick returns to the pill.
+                        if let Purpose::PickRegion { mut state } = this.purpose.clone() {
+                            state.scope = crate::launcher::Scope::Full;
+                            state.crop = None;
+                            window.remove_window();
+                            crate::launcher::open_window_with(state, cx);
+                        } else {
+                            cx.quit();
+                        }
+                    }
                     (Phase::Preview, "enter") | (Phase::Preview, "s") => this.save(cx),
                     (Phase::Preview, "e") => this.edit(window, cx),
                     (Phase::Idle, "enter") => match this.purpose.clone() {
@@ -393,6 +425,7 @@ impl Render for OverlayView {
                         Purpose::Record { height, mic } => {
                             this.start_record(None, height, mic, window, cx)
                         }
+                        Purpose::PickRegion { .. } => {}
                     },
                     _ => {}
                 }
@@ -435,6 +468,12 @@ impl Render for OverlayView {
                                 (Some(sel), Purpose::Record { height, mic }) => {
                                     this.start_record(Some(sel), height, mic, window, cx)
                                 }
+                                (Some(sel), Purpose::PickRegion { mut state }) => {
+                                    let (x, y, w, h) = this.selection_to_image(window, sel);
+                                    state.crop = Some((x.max(0) as u32, y.max(0) as u32, w, h));
+                                    window.remove_window();
+                                    crate::launcher::open_window_with(state, cx);
+                                }
                                 (None, _) => {
                                     this.phase = Phase::Idle;
                                     cx.notify();
@@ -475,6 +514,9 @@ impl Render for OverlayView {
                                 }
                                 Purpose::Record { .. } => {
                                     "Drag the area to record · Enter full screen · Esc cancel"
+                                }
+                                Purpose::PickRegion { .. } => {
+                                    "Drag to choose the area · Esc back"
                                 }
                             }),
                     );

@@ -36,6 +36,11 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 pub fn open_window(cx: &mut App) {
+    open_window_with(LauncherState::default(), cx);
+}
+
+/// Reopen the pill with restored selections (after a region pick).
+pub fn open_window_with(state: LauncherState, cx: &mut App) {
     let bounds = Bounds::centered(None, Size { width: px(820.), height: px(280.) }, cx);
     let window = cx.open_window(
         WindowOptions {
@@ -46,7 +51,7 @@ pub fn open_window(cx: &mut App) {
             ..Default::default()
         },
         |window, cx| {
-            let view = cx.new(|cx| LauncherView::new(window, cx));
+            let view = cx.new(|cx| LauncherView::new(state.clone(), window, cx));
             let handle = view.read(cx).focus_handle.clone();
             window.focus(&handle, cx);
             window.on_window_should_close(cx, |_, cx| {
@@ -63,15 +68,33 @@ pub fn open_window(cx: &mut App) {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Mode {
+pub enum Mode {
     Screenshot,
     Record,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Scope {
+pub enum Scope {
     Full,
     Crop,
+}
+
+/// Snapshot of the pill's selections, carried through the crop-pick round
+/// trip (pill closes → freeze-frame picker → pill reopens with the region).
+#[derive(Clone)]
+pub struct LauncherState {
+    pub mode: Mode,
+    pub scope: Scope,
+    pub res_ix: usize,
+    pub mic_ix: usize,
+    /// Picked region in stream/image pixels.
+    pub crop: Option<(u32, u32, u32, u32)>,
+}
+
+impl Default for LauncherState {
+    fn default() -> Self {
+        Self { mode: Mode::Screenshot, scope: Scope::Full, res_ix: 1, mic_ix: 0, crop: None }
+    }
 }
 
 struct LauncherView {
@@ -82,11 +105,13 @@ struct LauncherView {
     mics: Vec<(Option<String>, SharedString)>,
     mic_ix: usize,
     mic_open: bool,
+    /// Region picked via the freeze-frame selector (stream pixels).
+    crop: Option<(u32, u32, u32, u32)>,
     focus_handle: FocusHandle,
 }
 
 impl LauncherView {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(state: LauncherState, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut mics: Vec<(Option<String>, SharedString)> = vec![
             (None, "Don't record mic".into()),
             (Some("default".into()), "Default microphone".into()),
@@ -96,7 +121,7 @@ impl LauncherView {
         }
 
         let test_mode = std::env::var("ASHOT_TEST_MODE").unwrap_or_default();
-        let mode = if test_mode.starts_with("record") { Mode::Record } else { Mode::Screenshot };
+        let mode = if test_mode.starts_with("record") { Mode::Record } else { state.mode };
         if test_mode == "auto-full" {
             // Exercise the real click path (window close → async flow).
             cx.spawn_in(window, async move |this, cx| {
@@ -107,37 +132,69 @@ impl LauncherView {
         }
         let mic_open = test_mode == "record-mics";
         // Worst-case layout check: hook selects the longest mic name.
-        let mic_ix = if mic_open { mics.len().saturating_sub(2).max(0) } else { 0 };
+        let mic_ix = if mic_open {
+            mics.len().saturating_sub(2).max(0)
+        } else {
+            state.mic_ix.min(mics.len() - 1)
+        };
 
         Self {
             mode,
-            scope: Scope::Full,
-            res_ix: 1,
+            scope: state.scope,
+            res_ix: state.res_ix,
             mics,
             mic_ix,
             mic_open,
+            crop: state.crop,
             focus_handle: cx.focus_handle(),
         }
     }
 
-    /// The red button: execute the selected combination.
+    fn snapshot(&self) -> LauncherState {
+        LauncherState {
+            mode: self.mode,
+            scope: self.scope,
+            res_ix: self.res_ix,
+            mic_ix: self.mic_ix,
+            crop: self.crop,
+        }
+    }
+
+    /// Crop segment: hide the pill and pick a region on a clean freeze-frame.
+    fn start_pick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut state = self.snapshot();
+        state.scope = Scope::Crop;
+        window.remove_window();
+        capture_then_overlay(
+            overlay::OverlayStart::Select(overlay::Purpose::PickRegion { state }),
+            cx,
+        );
+    }
+
+    /// The red button: execute the selected combination. The region was
+    /// already picked when Crop was selected; execution uses a fresh capture
+    /// (screenshot) or the live stream (record) of that region.
     fn fire(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let height = RESOLUTIONS[self.res_ix].1;
         let mic = self.mics[self.mic_ix].0.clone();
+        if self.scope == Scope::Crop && self.crop.is_none() {
+            // No region picked yet — pick first, then the user fires again.
+            self.start_pick(window, cx);
+            return;
+        }
         window.remove_window();
         match (self.mode, self.scope) {
             (Mode::Screenshot, Scope::Full) => {
                 capture_then_overlay(overlay::OverlayStart::PreviewFull, cx)
             }
             (Mode::Screenshot, Scope::Crop) => capture_then_overlay(
-                overlay::OverlayStart::Select(overlay::Purpose::Screenshot),
+                overlay::OverlayStart::PreviewRegion(self.crop.expect("checked above")),
                 cx,
             ),
             (Mode::Record, Scope::Full) => start_recording_flow(None, Some(height), mic, cx),
-            (Mode::Record, Scope::Crop) => capture_then_overlay(
-                overlay::OverlayStart::Select(overlay::Purpose::Record { height, mic }),
-                cx,
-            ),
+            (Mode::Record, Scope::Crop) => {
+                start_recording_flow(self.crop, Some(height), mic, cx)
+            }
         }
     }
 
@@ -147,7 +204,7 @@ impl LauncherView {
         label: SharedString,
         active: bool,
         cx: &mut Context<Self>,
-        handler: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        handler: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
         div()
             .id(id)
@@ -166,7 +223,9 @@ impl LauncherView {
             .child(label)
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _: &MouseDownEvent, _, cx| handler(this, cx)),
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    handler(this, window, cx)
+                }),
             )
     }
 
@@ -226,12 +285,12 @@ impl Render for LauncherView {
             // Mode toggle.
             .child(
                 self.seg_group()
-                    .child(self.segment(("mode", 0), "Screenshot".into(), !record, cx, |this, cx| {
+                    .child(self.segment(("mode", 0), "Screenshot".into(), !record, cx, |this, _, cx| {
                         this.mode = Mode::Screenshot;
                         this.mic_open = false;
                         cx.notify();
                     }))
-                    .child(self.segment(("mode", 1), "⏺ Record".into(), record, cx, |this, cx| {
+                    .child(self.segment(("mode", 1), "⏺ Record".into(), record, cx, |this, _, cx| {
                         this.mode = Mode::Record;
                         cx.notify();
                     })),
@@ -245,20 +304,23 @@ impl Render for LauncherView {
                         "Full".into(),
                         self.scope == Scope::Full,
                         cx,
-                        |this, cx| {
+                        |this, _, cx| {
                             this.scope = Scope::Full;
                             cx.notify();
                         },
                     ))
                     .child(self.segment(
                         ("scope", 1),
-                        "Crop".into(),
+                        // Show the picked region; clicking re-picks.
+                        match self.crop {
+                            Some((_, _, w, h)) if self.scope == Scope::Crop => {
+                                format!("Crop {w}×{h}").into()
+                            }
+                            _ => "Crop".into(),
+                        },
                         self.scope == Scope::Crop,
                         cx,
-                        |this, cx| {
-                            this.scope = Scope::Crop;
-                            cx.notify();
-                        },
+                        |this, window, cx| this.start_pick(window, cx),
                     )),
             );
 
@@ -273,7 +335,7 @@ impl Render for LauncherView {
                     label.into(),
                     self.res_ix == ix,
                     cx,
-                    move |this, cx| {
+                    move |this, _, cx| {
                         this.res_ix = ix;
                         cx.notify();
                     },
