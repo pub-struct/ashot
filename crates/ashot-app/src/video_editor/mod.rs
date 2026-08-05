@@ -5,27 +5,37 @@
 //! (frame decode, whisper, export) runs on the background executor via the
 //! core helpers; the UI only ever touches decoded frames.
 
+mod inspector;
+mod preview;
+mod state;
+mod timeline;
+mod undo;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui::{
-    canvas, div, img, point, prelude::*, px, App, AnyElement, Bounds, Context, CursorStyle,
+    canvas, div, img, prelude::*, px, App, Bounds, Context, CursorStyle,
     FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Path as GpuiPath, Pixels, Point, RenderImage, SharedString, Size, Window,
+    MouseUpEvent, RenderImage, SharedString, Size, Window,
     WindowBounds, WindowOptions,
 };
 use tiny_skia::Pixmap;
 
-use ashot_core::spec::{Annotation, Style};
-use ashot_core::video::{self, VideoInfo, ZoomPoint};
+use ashot_core::spec::Style;
+use ashot_core::video::{self, VideoInfo};
 use ashot_core::Renderer;
 
-use crate::img::to_render_image;
 use crate::theme;
 
+use self::inspector::{render_inspector, INSPECTOR_W};
+use self::preview::paint_arrow;
+use self::state::EditState;
+use self::timeline::TimelineDrag;
+use self::undo::History;
+
 const TOOLBAR_H: f32 = 52.0;
-const TIMELINE_H: f32 = 72.0;
 const ZOOM_LEVELS: [(&str, f64); 3] = [("1.5×", 1.5), ("2×", 2.0), ("3×", 3.0)];
 const COLORS: [(&str, u32); 5] = [
     ("red", 0xff3b30),
@@ -48,12 +58,13 @@ pub fn run(path: PathBuf) -> anyhow::Result<()> {
 
 pub fn open_window(path: PathBuf, info: VideoInfo, cx: &mut App) {
     let (iw, ih) = (info.width as f32, info.height as f32);
-    let win_w = (iw * 0.75 + 32.0).clamp(960.0, 1680.0);
-    let win_h = (ih * 0.75 + TOOLBAR_H + TIMELINE_H + 32.0).clamp(600.0, 1020.0);
+    let win_w = (iw * 0.75 + INSPECTOR_W + 32.0).clamp(1100.0, 1800.0);
+    let win_h = (ih * 0.75 + TOOLBAR_H + timeline::TIMELINE_H + 32.0).clamp(680.0, 1080.0);
     let bounds = Bounds::centered(None, Size { width: px(win_w), height: px(win_h) }, cx);
     let window = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(Size { width: px(900.0), height: px(560.0) }),
             titlebar: Some(gpui::TitlebarOptions {
                 title: Some(SharedString::from(format!(
                     "ashot — {}",
@@ -112,18 +123,21 @@ struct VideoEditor {
     frame_native: Option<Pixmap>,
     /// Displayed frame (annotations burned for preview).
     frame: Option<Arc<RenderImage>>,
-    fetch_gen: usize,
+    fetch_in_flight: bool,
+    fetch_queued: bool,
     playing: bool,
 
-    /// Ranges to REMOVE (seconds).
-    cuts: Vec<(f64, f64)>,
-    cut_pending: Option<f64>,
+    /// Cuts, zoom points, annotations, caption-burn toggle — the undoable
+    /// edit state. See `state::EditState`.
+    state: EditState,
+    /// Snapshot-based undo/redo stack over `state`. See `undo::History`.
+    history: History,
+    /// Currently-selected timeline item (unused this stage beyond being
+    /// present — Stages 2/3 wire real selection UX).
+    selection: state::Selection,
 
-    zooms: Vec<ZoomPoint>,
-    zoom_arming: bool,
     zoom_level_ix: usize,
 
-    annotations: Vec<Annotation>,
     tool: Option<Tool>,
     color_ix: usize,
     drag_start: Option<(f32, f32)>,
@@ -133,32 +147,50 @@ struct VideoEditor {
 
     srt: Option<PathBuf>,
     cc_status: Option<SharedString>,
-    burn_cc: bool,
 
     exporting: bool,
     export_progress: Arc<Mutex<f64>>,
     status: Option<SharedString>,
 
     scrubbing: bool,
+    /// In-flight timeline drag (segment edge / zoom body / zoom edge). See
+    /// `timeline::TimelineDrag`; commits to `history` once, on mouse-up.
+    timeline_drag: Option<TimelineDrag>,
+    /// In-flight crop-rect drag on the preview (move center / resize level)
+    /// for the selected zoom segment. See `preview::PreviewDrag`.
+    preview_drag: Option<preview::PreviewDrag>,
+
+    /// Video-lane thumbnail strip; `None` while the background extraction is
+    /// in flight (see `load_timeline_media`).
+    thumbnails: Option<Vec<(f64, Arc<RenderImage>)>>,
+    /// Audio-lane waveform peaks; `None` while loading, `Some(empty)` if the
+    /// source has no audio track.
+    peaks: Option<Arc<Vec<(f32, f32)>>>,
+    /// Captions-lane cues, parsed from `srt`; empty until captions exist.
+    cues: Vec<ashot_core::srt::Cue>,
+    /// Guards the one-shot background media load against stale results.
+    media_gen: usize,
+
     focus_handle: FocusHandle,
 }
 
 impl VideoEditor {
     fn new(path: PathBuf, info: VideoInfo, cx: &mut Context<Self>) -> Self {
+        let state = EditState::new(info.duration_s);
+        let history = History::new(state.clone());
         let mut this = Self {
             path,
             info,
             playhead: 0.0,
             frame_native: None,
             frame: None,
-            fetch_gen: 0,
+            fetch_in_flight: false,
+            fetch_queued: false,
             playing: false,
-            cuts: Vec::new(),
-            cut_pending: None,
-            zooms: Vec::new(),
-            zoom_arming: false,
+            state,
+            history,
+            selection: state::Selection::None,
             zoom_level_ix: 1,
-            annotations: Vec::new(),
             tool: None,
             color_ix: 0,
             drag_start: None,
@@ -167,22 +199,117 @@ impl VideoEditor {
             renderer: Renderer::new(),
             srt: None,
             cc_status: None,
-            burn_cc: false,
             exporting: false,
             export_progress: Arc::new(Mutex::new(0.0)),
             status: None,
             scrubbing: false,
+            timeline_drag: None,
+            preview_drag: None,
+            thumbnails: None,
+            peaks: None,
+            cues: Vec::new(),
+            media_gen: 0,
             focus_handle: cx.focus_handle(),
         };
+        // If a same-named .srt sidecar already exists from a prior session,
+        // pick it up so the captions lane isn't empty on reopen.
+        let sidecar = this.path.with_extension("srt");
+        if sidecar.exists() {
+            this.srt = Some(sidecar);
+        }
         this.fetch_frame(cx);
+        this.load_timeline_media(cx);
+        this.reload_cues(cx);
         this
+    }
+
+    // ---- background media (thumbnails / waveform / caption cues) ----
+
+    /// Fires once: extracts thumbnails + waveform peaks in the background and
+    /// caches them (keyed by canonicalized path) so reopening the same video
+    /// is instant. See `ashot-app/src/timeline_media.rs`.
+    fn load_timeline_media(&mut self, cx: &mut Context<Self>) {
+        if let Some(cached) = crate::timeline_media::cached(&self.path) {
+            self.thumbnails = Some(cached.thumbnails.clone());
+            self.peaks = Some(cached.peaks.clone());
+            cx.notify();
+            return;
+        }
+        self.media_gen += 1;
+        let gen = self.media_gen;
+        let path = self.path.clone();
+        let duration = self.info.duration_s;
+        cx.spawn(async move |this, cx| {
+            let (path, thumbs, peaks) = cx
+                .background_executor()
+                .spawn(async move {
+                    let thumbs = ashot_core::thumbnails::extract_thumbnails(&path, duration, 24, 90)
+                        .unwrap_or_default();
+                    let peaks = ashot_core::audio::extract_peaks(&path, 1500);
+                    (path, thumbs, peaks)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.media_gen != gen {
+                    return;
+                }
+                let images: Vec<(f64, Arc<RenderImage>)> = thumbs
+                    .into_iter()
+                    .map(|t| (t.t, crate::img::into_render_image(t.pixmap)))
+                    .collect();
+                let peaks = Arc::new(peaks.peaks);
+                crate::timeline_media::insert(
+                    &path,
+                    Arc::new(crate::timeline_media::TimelineMedia {
+                        thumbnails: images.clone(),
+                        peaks: peaks.clone(),
+                    }),
+                );
+                this.thumbnails = Some(images);
+                this.peaks = Some(peaks);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Re-derive the captions lane from `self.srt`. Called on startup (if an
+    /// SRT sidecar already exists) and again after `generate_captions`
+    /// succeeds, since cues can change mid-session.
+    fn reload_cues(&mut self, cx: &mut Context<Self>) {
+        let Some(srt) = self.srt.clone() else {
+            self.cues.clear();
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let cues = cx
+                .background_executor()
+                .spawn(async move { ashot_core::srt::parse_srt(&srt).unwrap_or_default() })
+                .await;
+            this.update(cx, |this, cx| {
+                this.cues = cues;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // ---- frames ----
 
     fn fetch_frame(&mut self, cx: &mut Context<Self>) {
-        self.fetch_gen += 1;
-        let gen = self.fetch_gen;
+        // Extraction spawns a subprocess and can outlast a playback tick
+        // (120ms). Keep exactly one extraction in flight and always display
+        // what it returns; if the playhead moved meanwhile, chain the next
+        // fetch. Dropping stale frames instead (the old generation-counter
+        // approach) starved the display during playback and scrubbing.
+        if self.fetch_in_flight {
+            self.fetch_queued = true;
+            return;
+        }
+        self.fetch_in_flight = true;
         let path = self.path.clone();
         let t = self.playhead;
         cx.spawn(async move |this, cx| {
@@ -191,37 +318,19 @@ impl VideoEditor {
                 .spawn(async move { video::extract_frame(&path, t) })
                 .await;
             this.update(cx, |this, cx| {
-                if this.fetch_gen == gen {
-                    if let Ok(pixmap) = frame {
-                        this.frame_native = Some(pixmap);
-                        this.refresh_display(cx);
-                    }
+                this.fetch_in_flight = false;
+                if let Ok(pixmap) = frame {
+                    this.frame_native = Some(pixmap);
+                    this.refresh_display(cx);
+                }
+                if this.fetch_queued || this.playhead != t {
+                    this.fetch_queued = false;
+                    this.fetch_frame(cx);
                 }
             })
             .ok();
         })
         .detach();
-    }
-
-    /// Burn current annotations (+typing preview) onto the frame for display.
-    fn refresh_display(&mut self, cx: &mut Context<Self>) {
-        let Some(base) = &self.frame_native else { return };
-        let mut shown = base.clone();
-        let mut all = self.annotations.clone();
-        if let Some((x, y, text)) = &self.typing {
-            all.push(Annotation::Text {
-                x: *x,
-                y: *y,
-                text: format!("{text}▎"),
-                size: Some(28.0),
-                style: self.style(),
-            });
-        }
-        if !all.is_empty() {
-            let _ = self.renderer.render(&mut shown, &all);
-        }
-        self.frame = Some(crate::img::into_render_image(shown));
-        cx.notify();
     }
 
     fn style(&self) -> Style {
@@ -230,30 +339,6 @@ impl VideoEditor {
             stroke_width: Some(5.0),
             fill_opacity: None,
         }
-    }
-
-    // ---- geometry ----
-
-    fn fit(&self, viewport: Size<Pixels>) -> (f32, f32, f32) {
-        let (cw, ch) = (
-            f32::from(viewport.width),
-            f32::from(viewport.height) - TOOLBAR_H - TIMELINE_H,
-        );
-        let (iw, ih) = (self.info.width as f32, self.info.height as f32);
-        let scale = (cw / iw).min(ch / ih);
-        let ox = (cw - iw * scale) / 2.0;
-        let oy = TOOLBAR_H + (ch - ih * scale) / 2.0;
-        (ox, oy, scale)
-    }
-
-    fn to_video_coords(&self, pos: Point<Pixels>, viewport: Size<Pixels>) -> Option<(f32, f32)> {
-        let (ox, oy, scale) = self.fit(viewport);
-        let x = (f32::from(pos.x) - ox) / scale;
-        let y = (f32::from(pos.y) - oy) / scale;
-        if x < 0.0 || y < 0.0 || x > self.info.width as f32 || y > self.info.height as f32 {
-            return None;
-        }
-        Some((x, y))
     }
 
     // ---- playback ----
@@ -270,11 +355,12 @@ impl VideoEditor {
                             return false;
                         }
                         let mut t = this.playhead + step;
-                        // Skip removed ranges during playback.
-                        for (s, e) in &this.cuts {
-                            if t >= *s && t < *e {
-                                t = *e;
-                            }
+                        // Skip removed ranges during playback (adjacent removed
+                        // segments must be skipped in one hop).
+                        while let Some(seg) =
+                            this.state.segments.iter().find(|s| s.removed && t >= s.start && t < s.end)
+                        {
+                            t = seg.end;
                         }
                         if t >= this.info.duration_s {
                             this.playing = false;
@@ -296,46 +382,49 @@ impl VideoEditor {
         cx.notify();
     }
 
-    // ---- cutting ----
+    // ---- cutting: split-and-delete ----
 
-    fn cut_click(&mut self, cx: &mut Context<Self>) {
-        match self.cut_pending.take() {
-            None => {
-                self.cut_pending = Some(self.playhead);
-                self.status = Some("Move the playhead, then press ✂ again to cut the range".into());
-            }
-            Some(start) => {
-                let (a, b) = if start <= self.playhead {
-                    (start, self.playhead)
-                } else {
-                    (self.playhead, start)
-                };
-                if b - a > 0.05 {
-                    self.cuts.push((a, b));
-                    self.cuts.sort_by(|x, y| x.0.total_cmp(&y.0));
-                    self.status = Some(format!("Cut {:.1}s – {:.1}s", a, b).into());
-                }
-            }
+    /// Split the video track at the playhead ('S' key / Split button).
+    fn split_click(&mut self, cx: &mut Context<Self>) {
+        if self.state.split_at(self.playhead) {
+            self.history.commit(self.state.clone());
+            self.status = Some(format!("Split at {:.1}s", self.playhead).into());
+            cx.notify();
         }
-        cx.notify();
     }
 
-    fn keep_ranges(&self) -> Vec<(f64, f64)> {
-        if self.cuts.is_empty() {
-            return Vec::new();
+    /// Remove the selected video segment (Delete/Backspace). Shown dimmed,
+    /// skipped during playback, excluded at export — never actually deleted
+    /// from `segments` so it can be restored.
+    fn delete_selected_segment(&mut self, cx: &mut Context<Self>) {
+        if let state::Selection::VideoSegment(ix) = self.selection {
+            self.state.delete_segment(ix);
+            self.history.commit(self.state.clone());
+            cx.notify();
         }
-        let mut keep = Vec::new();
-        let mut t = 0.0;
-        for (s, e) in &self.cuts {
-            if *s > t + 0.05 {
-                keep.push((t, *s));
-            }
-            t = t.max(*e);
-        }
-        if t + 0.05 < self.info.duration_s {
-            keep.push((t, self.info.duration_s));
-        }
-        keep
+    }
+
+    // ---- zoom segments ----
+
+    /// "+ Zoom" toolbar affordance: insert a new zoom segment centered on
+    /// the playhead (default duration 3.0s, frame-center framing, the
+    /// currently-selected preset level), then select it so the crop rect and
+    /// quick inspector appear for the user to drag into place. Replaces the
+    /// old click-to-place `zoom_arming` flow.
+    pub(super) fn add_zoom_at_playhead(&mut self, cx: &mut Context<Self>) {
+        let level = ZOOM_LEVELS[self.zoom_level_ix].1;
+        let ix = self.state.add_zoom(
+            self.playhead,
+            self.info.width as f64 / 2.0,
+            self.info.height as f64 / 2.0,
+            level,
+            3.0,
+            self.info.duration_s,
+        );
+        self.selection = state::Selection::Zoom(ix);
+        self.history.commit(self.state.clone());
+        self.status = Some(format!("Zoom {level}× added at {:.1}s", self.playhead).into());
+        self.refresh_display(cx);
     }
 
     // ---- captions ----
@@ -374,8 +463,10 @@ impl VideoEditor {
                 match result {
                     Ok(()) => {
                         this.srt = Some(srt_path.clone());
-                        this.burn_cc = true;
+                        this.state.burn_cc = true;
+                        this.history.commit(this.state.clone());
                         this.cc_status = Some("CC ✓".into());
+                        this.reload_cues(cx);
                     }
                     Err(e) => {
                         this.cc_status = Some(format!("CC failed: {e}").into());
@@ -403,11 +494,11 @@ impl VideoEditor {
         let output = self.path.with_file_name(format!("{stem}-edited.mp4"));
 
         // Annotations become a transparent overlay PNG at native resolution.
-        let overlay_png = if self.annotations.is_empty() {
+        let overlay_png = if self.state.annotations.is_empty() {
             None
         } else {
             let mut overlay = Pixmap::new(self.info.width, self.info.height);
-            overlay.as_mut().map(|pm| self.renderer.render(pm, &self.annotations));
+            overlay.as_mut().map(|pm| self.renderer.render(pm, &self.state.annotations));
             overlay.and_then(|pm| {
                 let p = std::env::temp_dir().join(format!("ashot-overlay-{}.png", std::process::id()));
                 pm.save_png(&p).ok().map(|_| p)
@@ -417,10 +508,10 @@ impl VideoEditor {
         let spec = video::ExportSpec {
             input: self.path.clone(),
             output,
-            keep: self.keep_ranges(),
-            zooms: self.zooms.clone(),
+            keep: self.state.keep_ranges(self.info.duration_s),
+            zooms: self.state.zooms.clone(),
             overlay_png,
-            srt: if self.burn_cc { self.srt.clone() } else { None },
+            srt: if self.state.burn_cc { self.srt.clone() } else { None },
         };
         let progress = self.export_progress.clone();
 
@@ -476,115 +567,6 @@ impl VideoEditor {
         cx.notify();
     }
 
-    // ---- input on preview ----
-
-    fn preview_down(&mut self, pos: Point<Pixels>, viewport: Size<Pixels>, cx: &mut Context<Self>) {
-        if self.typing.is_some() {
-            self.commit_typing(cx);
-            return;
-        }
-        let Some((x, y)) = self.to_video_coords(pos, viewport) else { return };
-        if self.zoom_arming {
-            let level = ZOOM_LEVELS[self.zoom_level_ix].1;
-            self.zooms.push(ZoomPoint {
-                t: self.playhead,
-                cx: x as f64,
-                cy: y as f64,
-                level,
-                duration: 3.0,
-            });
-            self.zoom_arming = false;
-            self.status =
-                Some(format!("Zoom {level}× at {:.1}s (click marker to remove)", self.playhead).into());
-            cx.notify();
-            return;
-        }
-        match self.tool {
-            Some(Tool::Marker) => {
-                let number = self
-                    .annotations
-                    .iter()
-                    .filter_map(|a| match a {
-                        Annotation::Marker { number, .. } => *number,
-                        _ => None,
-                    })
-                    .max()
-                    .map_or(1, |m| m + 1);
-                self.annotations.push(Annotation::Marker {
-                    x,
-                    y,
-                    number: Some(number),
-                    size: None,
-                    style: self.style(),
-                });
-                self.refresh_display(cx);
-            }
-            Some(Tool::Text) => {
-                self.typing = Some((x, y, String::new()));
-                self.refresh_display(cx);
-            }
-            Some(_) => self.drag_start = Some((x, y)),
-            None => {}
-        }
-    }
-
-    fn preview_move(&mut self, pos: Point<Pixels>, viewport: Size<Pixels>, cx: &mut Context<Self>) {
-        if self.drag_start.is_none() {
-            return;
-        }
-        if let Some(p) = self.to_video_coords(pos, viewport) {
-            self.drag_current = Some(p);
-            cx.notify();
-        }
-    }
-
-    fn preview_up(&mut self, pos: Point<Pixels>, viewport: Size<Pixels>, cx: &mut Context<Self>) {
-        let Some((sx, sy)) = self.drag_start.take() else { return };
-        let (x, y) = self.to_video_coords(pos, viewport).or(self.drag_current).unwrap_or((sx, sy));
-        self.drag_current = None;
-        if (x - sx).abs() > 3.0 || (y - sy).abs() > 3.0 {
-            let style = self.style();
-            let annotation = match self.tool {
-                Some(Tool::Arrow) => {
-                    Annotation::Arrow { from: [sx, sy], to: [x, y], style, label: None }
-                }
-                Some(Tool::Ellipse) => Annotation::Ellipse {
-                    x: sx.min(x),
-                    y: sy.min(y),
-                    w: (x - sx).abs(),
-                    h: (y - sy).abs(),
-                    style,
-                    label: None,
-                },
-                _ => Annotation::Rect {
-                    x: sx.min(x),
-                    y: sy.min(y),
-                    w: (x - sx).abs(),
-                    h: (y - sy).abs(),
-                    style,
-                    label: None,
-                },
-            };
-            self.annotations.push(annotation);
-        }
-        self.refresh_display(cx);
-    }
-
-    fn commit_typing(&mut self, cx: &mut Context<Self>) {
-        if let Some((x, y, text)) = self.typing.take() {
-            if !text.is_empty() {
-                self.annotations.push(Annotation::Text {
-                    x,
-                    y,
-                    text,
-                    size: Some(28.0),
-                    style: self.style(),
-                });
-            }
-        }
-        self.refresh_display(cx);
-    }
-
     fn key_down(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = ev.keystroke.key.as_str();
         if let Some((_, _, buf)) = &mut self.typing {
@@ -615,14 +597,24 @@ impl VideoEditor {
         }
         match key {
             "space" => self.toggle_play(cx),
-            "c" => self.cut_click(cx),
-            "z" if ev.keystroke.modifiers.control => {
-                self.annotations.pop();
-                self.refresh_display(cx);
+            "s" => self.split_click(cx),
+            "delete" | "backspace" => self.delete_selected_segment(cx),
+            "z" if ev.keystroke.modifiers.control && ev.keystroke.modifiers.shift => {
+                if let Some(new) = self.history.redo() {
+                    self.state = new.clone();
+                    self.clamp_selection();
+                    self.refresh_display(cx);
+                }
             }
-            "escape" if self.zoom_arming || self.cut_pending.is_some() => {
-                self.zoom_arming = false;
-                self.cut_pending = None;
+            "z" if ev.keystroke.modifiers.control => {
+                if let Some(new) = self.history.undo() {
+                    self.state = new.clone();
+                    self.clamp_selection();
+                    self.refresh_display(cx);
+                }
+            }
+            "escape" if self.selection != state::Selection::None => {
+                self.selection = state::Selection::None;
                 self.status = None;
                 cx.notify();
             }
@@ -641,12 +633,17 @@ impl VideoEditor {
         }
     }
 
-    fn scrub_to(&mut self, pos: Point<Pixels>, viewport: Size<Pixels>, cx: &mut Context<Self>) {
-        let width = f32::from(viewport.width).max(1.0);
-        let frac = (f32::from(pos.x) / width).clamp(0.0, 1.0) as f64;
-        self.playhead = frac * self.info.duration_s;
-        self.fetch_frame(cx);
-        cx.notify();
+    /// Reset `selection` to `None` if it now indexes past the end of the
+    /// current `state`'s segments/zooms (after undo/redo, delete, remove).
+    fn clamp_selection(&mut self) {
+        let out_of_bounds = match self.selection {
+            state::Selection::None => false,
+            state::Selection::VideoSegment(i) => i >= self.state.segments.len(),
+            state::Selection::Zoom(i) => i >= self.state.zooms.len(),
+        };
+        if out_of_bounds {
+            self.selection = state::Selection::None;
+        }
     }
 
     // ---- small UI helpers ----
@@ -690,14 +687,12 @@ impl Render for VideoEditor {
         let viewport = window.viewport_size();
         let (ox, oy, scale) = self.fit(viewport);
         let (dw, dh) = (self.info.width as f32 * scale, self.info.height as f32 * scale);
-        let duration = self.info.duration_s.max(0.01);
 
-        // ---- toolbar ----
+        // ---- toolbar: tools + transport only (export/CC/zoom-presets live
+        // in the inspector now, see `inspector.rs`) ----
         let mut toolbar = div()
-            .absolute()
-            .left_0()
-            .top_0()
-            .w(viewport.width)
+            .flex_none()
+            .w_full()
             .h(px(TOOLBAR_H))
             .flex()
             .flex_row()
@@ -715,38 +710,9 @@ impl Render for VideoEditor {
                 cx,
                 |this, cx| this.toggle_play(cx),
             ))
-            .child(self.chip(
-                ("cut", 0),
-                if self.cut_pending.is_some() { "✂ …to here".into() } else { "✂ Cut".into() },
-                self.cut_pending.is_some(),
-                cx,
-                |this, cx| this.cut_click(cx),
-            ))
-            .child(self.chip(
-                ("zoomarm", 0),
-                "🔍 Zoom".into(),
-                self.zoom_arming,
-                cx,
-                |this, cx| {
-                    this.zoom_arming = !this.zoom_arming;
-                    this.status = this
-                        .zoom_arming
-                        .then(|| "Click on the video where the zoom should focus".into());
-                    cx.notify();
-                },
-            ));
-        for ix in 0..ZOOM_LEVELS.len() {
-            toolbar = toolbar.child(self.chip(
-                ("zl", ix),
-                ZOOM_LEVELS[ix].0.into(),
-                self.zoom_level_ix == ix,
-                cx,
-                move |this, cx| {
-                    this.zoom_level_ix = ix;
-                    cx.notify();
-                },
-            ));
-        }
+            .child(self.chip(("split", 0), "✂ Split".into(), false, cx, |this, cx| {
+                this.split_click(cx)
+            }));
         toolbar = toolbar.child(div().w(px(1.)).h(px(22.)).bg(theme::border()).mx_1());
         for tool in Tool::all() {
             let active = self.tool == Some(tool);
@@ -784,180 +750,68 @@ impl Render for VideoEditor {
                     ),
             );
         }
-        toolbar = toolbar
-            .child(div().flex_1())
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme::text_muted())
-                    .mr_2()
-                    .max_w(px(360.))
-                    .overflow_hidden()
-                    .child(
-                        self.status
-                            .clone()
-                            .or_else(|| self.cc_status.clone())
-                            .unwrap_or_else(|| {
-                                format!(
-                                    "{:.1}s / {:.1}s",
-                                    self.playhead, self.info.duration_s
-                                )
-                                .into()
-                            }),
-                    ),
-            )
-            .child(self.chip(
-                ("cc", 0),
-                match (&self.srt, self.burn_cc) {
-                    (Some(_), true) => "CC ✓ burn".into(),
-                    (Some(_), false) => "CC (off)".into(),
-                    (None, _) => "CC generate".into(),
-                },
-                self.srt.is_some() && self.burn_cc,
-                cx,
-                |this, cx| {
-                    if this.srt.is_some() {
-                        this.burn_cc = !this.burn_cc;
-                        cx.notify();
-                    } else {
-                        this.generate_captions(cx);
-                    }
-                },
-            ))
-            .child(
-                div()
-                    .id("export")
-                    .px_3()
-                    .py_1p5()
-                    .flex_none()
-                    .rounded_md()
-                    .cursor(CursorStyle::PointingHand)
-                    .bg(theme::accent())
-                    .text_color(gpui::rgb(0xffffff))
-                    .text_sm()
-                    .hover(|s| s.bg(theme::accent_hover()))
-                    .child(if self.exporting { "Exporting…" } else { "Export" })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, _, cx| this.export(cx)),
-                    ),
-            );
-
-        // ---- timeline ----
-        let tl_top = f32::from(viewport.height) - TIMELINE_H;
-        let tl_w = f32::from(viewport.width);
-        let mut timeline = div()
-            .id("timeline")
-            .absolute()
-            .left_0()
-            .top(px(tl_top))
-            .w(viewport.width)
-            .h(px(TIMELINE_H))
-            .bg(theme::surface())
-            .border_t_1()
-            .border_color(theme::border())
-            .cursor(CursorStyle::PointingHand)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                    this.scrubbing = true;
-                    this.scrub_to(ev.position, window.viewport_size(), cx);
-                }),
-            )
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
-                if this.scrubbing {
-                    this.scrub_to(ev.position, window.viewport_size(), cx);
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                    this.scrubbing = false;
-                    cx.notify();
-                }),
-            )
-            // Track base.
-            .child(
-                div()
-                    .absolute()
-                    .left(px(0.))
-                    .top(px(20.))
-                    .w(viewport.width)
-                    .h(px(24.))
-                    .bg(theme::bg()),
-            );
-        // Cut ranges (red).
-        for (s, e) in &self.cuts {
-            let x = (s / duration) as f32 * tl_w;
-            let w = (((e - s) / duration) as f32 * tl_w).max(2.0);
-            timeline = timeline.child(
-                div()
-                    .absolute()
-                    .left(px(x))
-                    .top(px(20.))
-                    .w(px(w))
-                    .h(px(24.))
-                    .bg(gpui::rgba(0xff3b3066)),
-            );
-        }
-        // Pending cut start marker.
-        if let Some(s) = self.cut_pending {
-            let x = (s / duration) as f32 * tl_w;
-            timeline = timeline.child(
-                div().absolute().left(px(x)).top(px(16.)).w(px(2.)).h(px(32.)).bg(gpui::rgb(0xff3b30)),
-            );
-        }
-        // Zoom markers.
-        for (ix, z) in self.zooms.iter().enumerate() {
-            let x = (z.t / duration) as f32 * tl_w;
-            timeline = timeline.child(
-                div()
-                    .id(("zm", ix))
-                    .absolute()
-                    .left(px(x - 7.0))
-                    .top(px(2.))
-                    .w(px(14.))
-                    .h(px(14.))
-                    .rounded_full()
-                    .bg(theme::accent())
-                    .cursor(CursorStyle::PointingHand)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                            this.zooms.remove(ix);
-                            this.status = Some("Zoom removed".into());
-                            cx.notify();
+        toolbar = toolbar.child(div().flex_1()).child(
+            div()
+                .text_xs()
+                .text_color(theme::text_muted())
+                .mr_2()
+                .max_w(px(360.))
+                .overflow_hidden()
+                .child(
+                    self.status
+                        .clone()
+                        .or_else(|| self.cc_status.clone())
+                        .unwrap_or_else(|| {
+                            format!("{:.1}s / {:.1}s", self.playhead, self.info.duration_s).into()
                         }),
-                    ),
-            );
-        }
-        // Playhead.
-        let phx = (self.playhead / duration) as f32 * tl_w;
-        timeline = timeline.child(
-            div().absolute().left(px(phx)).top(px(12.)).w(px(2.)).h(px(40.)).bg(gpui::rgb(0xffffff)),
+                ),
         );
 
-        // ---- preview + drag overlay ----
-        let mut root = div()
+        // ---- timeline (ruler + video/zoom/audio/captions lanes) ----
+        let timeline_el = timeline::render_timeline(self, window, cx);
+
+        // ---- preview column (flex_1 in the middle row, absolute overlay
+        // children positioned relative to its own top-left via `fit()`) ----
+        let mut preview_col = div()
             .id("veditor")
             .relative()
-            .size_full()
+            .flex_1()
+            .h_full()
+            .min_w(px(0.))
+            .overflow_hidden()
             .bg(theme::bg())
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.key_down(ev, cx)));
 
         if let Some(frame) = &self.frame {
-            root = root.child(
+            // Live zoom as a layout transform: the eased crop window
+            // (`crop_rect_for`, same math as export) maps onto the fit rect
+            // by scaling the full-frame texture up and offsetting it, clipped
+            // by the column's `overflow_hidden`. No per-frame pixmap work.
+            let (ix, iy, iw, ih) = match state::crop_rect_for(
+                self.playhead,
+                &self.state.zooms,
+                self.info.width as f64,
+                self.info.height as f64,
+            ) {
+                Some((x0, y0, vw, _vh)) => {
+                    let k = self.info.width as f64 / vw;
+                    let zs = scale * k as f32;
+                    (ox - x0 as f32 * zs, oy - y0 as f32 * zs, dw * k as f32, dh * k as f32)
+                }
+                None => (ox, oy, dw, dh),
+            };
+            preview_col = preview_col.child(
                 img(frame.clone())
                     .absolute()
-                    .left(px(ox))
-                    .top(px(oy))
-                    .w(px(dw))
-                    .h(px(dh)),
+                    .left(px(ix))
+                    .top(px(iy))
+                    .w(px(iw))
+                    .h(px(ih)),
             );
         }
         // Input layer over the preview.
-        root = root.child(
+        preview_col = preview_col.child(
             div()
                 .id("vcanvas")
                 .absolute()
@@ -965,7 +819,7 @@ impl Render for VideoEditor {
                 .top(px(oy))
                 .w(px(dw))
                 .h(px(dh))
-                .cursor(if self.zoom_arming || self.tool.is_some() {
+                .cursor(if self.tool.is_some() {
                     CursorStyle::Crosshair
                 } else {
                     CursorStyle::Arrow
@@ -1002,12 +856,12 @@ impl Render for VideoEditor {
                         .border_2()
                         .border_color(color);
                     let d = if self.tool == Some(Tool::Ellipse) { d.rounded_full() } else { d };
-                    root = root.child(d);
+                    preview_col = preview_col.child(d);
                 }
                 Some(Tool::Arrow) => {
                     let (fx, fy) = to_win(sx, sy);
                     let (tx, ty) = to_win(cx_, cy_);
-                    root = root.child(
+                    preview_col = preview_col.child(
                         canvas(
                             |_, _, _| (),
                             move |_, _, window, _| paint_arrow(window, fx, fy, tx, ty, 4.0, color),
@@ -1022,40 +876,45 @@ impl Render for VideoEditor {
             }
         }
 
-        root.child(toolbar).child(timeline)
+        // Crop-rect overlay on the preview for the selected zoom segment —
+        // drag body to recenter, drag a corner to change level (aspect
+        // stays locked since crop_for/peak_crop_rect divide both W and H by
+        // the same `level` scalar). Its readouts/presets/Remove live in the
+        // inspector panel (`inspector.rs`), not here.
+        if let state::Selection::Zoom(ix) = self.selection {
+            if let Some((x0, y0, vw, vh)) = self.peak_crop_rect(ix) {
+                let (wx, wy) = (ox + x0 as f32 * scale, oy + y0 as f32 * scale);
+                let (ww, wh) = (vw as f32 * scale, vh as f32 * scale);
+                preview_col = preview_col.child(
+                    div()
+                        .absolute()
+                        .left(px(wx))
+                        .top(px(wy))
+                        .w(px(ww))
+                        .h(px(wh))
+                        .border_2()
+                        .border_color(theme::accent())
+                        .cursor(CursorStyle::PointingHand),
+                );
+            }
+        }
+
+        // ---- root: flex column [toolbar / (preview | inspector) / timeline] ----
+        let middle_row = div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_row()
+            .child(preview_col)
+            .child(render_inspector(self, cx));
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme::bg())
+            .child(toolbar)
+            .child(middle_row)
+            .child(timeline_el)
     }
-}
-
-/// Fill-based arrow preview (same construction as the image editor's).
-fn paint_arrow(
-    window: &mut Window,
-    fx: f32,
-    fy: f32,
-    tx: f32,
-    ty: f32,
-    stroke_w: f32,
-    color: gpui::Rgba,
-) {
-    let (dx, dy) = (tx - fx, ty - fy);
-    let len = (dx * dx + dy * dy).sqrt();
-    if len < 2.0 {
-        return;
-    }
-    let (ux, uy) = (dx / len, dy / len);
-    let (nx, ny) = (-uy, ux);
-    let head_len = (stroke_w * 4.0).max(10.0).min(len * 0.5);
-    let head_w = head_len * 0.7;
-    let (bx, by) = (tx - ux * head_len, ty - uy * head_len);
-    let hs = (stroke_w / 2.0).max(0.5);
-
-    let mut shaft = GpuiPath::new(point(px(fx + nx * hs), px(fy + ny * hs)));
-    shaft.line_to(point(px(bx + nx * hs), px(by + ny * hs)));
-    shaft.line_to(point(px(bx - nx * hs), px(by - ny * hs)));
-    shaft.line_to(point(px(fx - nx * hs), px(fy - ny * hs)));
-    window.paint_path(shaft, color);
-
-    let mut head = GpuiPath::new(point(px(tx), px(ty)));
-    head.line_to(point(px(bx + nx * head_w / 2.0), px(by + ny * head_w / 2.0)));
-    head.line_to(point(px(bx - nx * head_w / 2.0), px(by - ny * head_w / 2.0)));
-    window.paint_path(head, color);
 }

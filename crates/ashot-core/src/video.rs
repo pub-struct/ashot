@@ -24,7 +24,7 @@ pub struct VideoInfo {
 }
 
 /// A smooth zoom event: eases in around `t`, holds, eases out.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ZoomPoint {
     /// Center time in seconds.
     pub t: f64,
@@ -228,7 +228,7 @@ print(json.dumps({'progress': 1.0}), flush=True)
 sys.exit(code[0])
 "#;
 
-fn helper_path(name: &str, source: &str) -> Result<PathBuf> {
+pub(crate) fn helper_path(name: &str, source: &str) -> Result<PathBuf> {
     let dir = dirs::config_dir()
         .ok_or_else(|| Error::Record("no config dir".into()))?
         .join("ashot");

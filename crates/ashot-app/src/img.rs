@@ -14,6 +14,28 @@ pub fn to_render_image(pixmap: &Pixmap) -> Arc<RenderImage> {
     into_render_image(pixmap.clone())
 }
 
+/// Crop `src` to the `(x, y, w, h)` source-pixel rect, clamped to the
+/// source's bounds. Used for live zoom preview (`state::crop_rect_for`'s
+/// output). Manual row-copy — `Pixmap` exposes `data()`/`data_mut()` as flat
+/// `&[u8]`/`&mut [u8]`, no cropping primitive of its own.
+pub fn crop_pixmap(src: &Pixmap, x: u32, y: u32, w: u32, h: u32) -> Option<Pixmap> {
+    let (sw, sh) = (src.width(), src.height());
+    let x = x.min(sw.saturating_sub(1));
+    let y = y.min(sh.saturating_sub(1));
+    let w = w.max(1).min(sw - x);
+    let h = h.max(1).min(sh - y);
+    let mut out = Pixmap::new(w, h)?;
+    let src_data = src.data();
+    let out_data = out.data_mut();
+    for row in 0..h {
+        let src_off = ((y + row) as usize * sw as usize + x as usize) * 4;
+        let dst_off = row as usize * w as usize * 4;
+        let len = w as usize * 4;
+        out_data[dst_off..dst_off + len].copy_from_slice(&src_data[src_off..src_off + len]);
+    }
+    Some(out)
+}
+
 /// Consumes the pixmap: swizzles in place and moves the buffer into the
 /// RenderImage — no extra allocation or copy.
 pub fn into_render_image(pixmap: Pixmap) -> Arc<RenderImage> {
