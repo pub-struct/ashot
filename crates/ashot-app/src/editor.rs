@@ -58,6 +58,11 @@ pub fn open_window(pixmap: Pixmap, source: Option<PathBuf>, cx: &mut App) {
             let view = cx.new(|cx| EditorView::new(pixmap, source, cx));
             let handle = view.read(cx).focus_handle.clone();
             window.focus(&handle, cx);
+            // The launcher app runs in explicit quit mode; make ✕ final here too.
+            window.on_window_should_close(cx, |_, cx| {
+                cx.quit();
+                true
+            });
             view
         },
     );

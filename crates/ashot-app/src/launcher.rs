@@ -14,15 +14,20 @@ use ashot_core::record::{RecordOptions, RESOLUTIONS};
 use crate::{overlay, recorder, theme};
 
 pub fn run() -> anyhow::Result<()> {
-    Application::with_platform(gpui_platform::current_platform(false)).run(|cx: &mut App| {
-        // Test hook: go straight to a full-screen recording (no launcher).
-        if std::env::var_os("ASHOT_TEST_MODE").is_some_and(|v| v == "record-start") {
-            start_recording_flow(None, Some(1080), cx);
-        } else {
-            open_window(cx);
-        }
-        cx.activate(true);
-    });
+    // Explicit quit mode: launcher flows close their window before opening the
+    // next one, and Linux's default (quit on last window closed) would kill
+    // the app mid-transition. Every terminal state calls cx.quit() itself.
+    Application::with_platform(gpui_platform::current_platform(false))
+        .with_quit_mode(gpui::QuitMode::Explicit)
+        .run(|cx: &mut App| {
+            // Test hook: go straight to a full-screen recording (no launcher).
+            if std::env::var_os("ASHOT_TEST_MODE").is_some_and(|v| v == "record-start") {
+                start_recording_flow(None, Some(1080), cx);
+            } else {
+                open_window(cx);
+            }
+            cx.activate(true);
+        });
     Ok(())
 }
 
@@ -38,9 +43,14 @@ pub fn open_window(cx: &mut App) {
             ..Default::default()
         },
         |window, cx| {
-            let view = cx.new(|cx| LauncherView::new(cx));
+            let view = cx.new(|cx| LauncherView::new(window, cx));
             let handle = view.read(cx).focus_handle.clone();
             window.focus(&handle, cx);
+            // Explicit quit mode: titlebar ✕ must end the app itself.
+            window.on_window_should_close(cx, |_, cx| {
+                cx.quit();
+                true
+            });
             view
         },
     );
@@ -69,13 +79,23 @@ struct LauncherView {
 }
 
 impl LauncherView {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Test hook: start in record mode for automated visual checks.
         let mode = if std::env::var_os("ASHOT_TEST_MODE").is_some_and(|v| v == "record") {
             Mode::Record
         } else {
             Mode::Screenshot
         };
+        // Test hook: trigger the Full action through the real click path
+        // (window close → async flow) one second after opening.
+        if std::env::var_os("ASHOT_TEST_MODE").is_some_and(|v| v == "auto-full") {
+            cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                this.update_in(cx, |this, window, cx| this.go(Scope::Full, window, cx))
+                    .ok();
+            })
+            .detach();
+        }
         Self { mode, res_ix: 1, focus_handle: cx.focus_handle() }
     }
 
