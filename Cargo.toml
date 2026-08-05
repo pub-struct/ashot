@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/ashot-core", "crates/ashot", "crates/ashot-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tiny-skia = "0.11"
+cosmic-text = "0.12"
+# async-std flavor: matches GPUI's zbus expectations (tokio feature would flip
+# zbus into requiring a tokio reactor inside the GPUI app and panic).
+ashpd = { version = "0.11", default-features = false, features = ["async-std"] }
+futures = "0.3"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+wl-clipboard-rs = "0.9"
+anyhow = "1"
+# Pinned rev per DESIGN.md: GPUI is a git dep with API churn; bump deliberately.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "6153542cf6e375c8ce45ae97eec67ec1b75b8aa5" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "6153542cf6e375c8ce45ae97eec67ec1b75b8aa5", features = ["wayland", "x11"] }
+image = { version = "0.25", default-features = false }
+smallvec = "1"
+
+[profile.release]
+lto = "thin"
+strip = true

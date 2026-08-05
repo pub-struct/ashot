@@ -1,0 +1,16 @@
+[package]
+name = "ashot-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ashot-core = { path = "../ashot-core" }
+anyhow.workspace = true
+chrono.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+image.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
+tiny-skia.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "ashot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ashot"
+path = "src/main.rs"
+
+[dependencies]
+ashot-core = { path = "../ashot-core" }
+ashot-app = { path = "../ashot-app" }
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tiny-skia.workspace = true

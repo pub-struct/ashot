@@ -1,0 +1,4 @@
+[toolchain]
+# Zed main (our gpui pin) requires >= 1.95; track current stable.
+channel = "stable"
+profile = "minimal"
