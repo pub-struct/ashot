@@ -2,15 +2,18 @@
 //!
 //!   [Screenshot|Record] │ [Full|Crop] ([720p|1080p|2K] [🎤 mic]) (●)
 //!
-//! One red button executes the selected combination. Record mode adds the
-//! resolution selector and a microphone picker.
+//! Selecting Crop enters a live crop session: a fullscreen *transparent*
+//! window with a light scrim — the real desktop stays visible underneath —
+//! where the region can be dragged (and re-dragged) while the pill floats on
+//! top. Nothing is captured until the red button fires; at that point our
+//! window unmaps first, so the UI is never in the result.
 
 use std::time::Duration;
 
 use gpui::{
     div, prelude::*, px, App, Application, Bounds, Context, CursorStyle, FocusHandle, Focusable,
-    KeyDownEvent, MouseButton, MouseDownEvent, SharedString, Size, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    SharedString, Size, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
 
 use ashot_core::record::{RecordOptions, RESOLUTIONS};
@@ -26,7 +29,7 @@ pub fn run() -> anyhow::Result<()> {
         .run(|cx: &mut App| {
             // Test hook: go straight to a full-screen recording (no launcher).
             if std::env::var_os("ASHOT_TEST_MODE").is_some_and(|v| v == "record-start") {
-                start_recording_flow(None, Some(1080), None, cx);
+                start_recording_flow(None, Some(1080), None, false, cx);
             } else {
                 open_window(cx);
             }
@@ -35,23 +38,65 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum Mode {
+    Screenshot,
+    Record,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Scope {
+    Full,
+    Crop,
+}
+
+/// The pill's selections, carried across window swaps (plain ↔ crop session).
+#[derive(Clone)]
+pub struct LauncherState {
+    pub mode: Mode,
+    pub scope: Scope,
+    pub res_ix: usize,
+    pub mic_ix: usize,
+    pub system_audio: bool,
+}
+
+impl Default for LauncherState {
+    fn default() -> Self {
+        Self { mode: Mode::Screenshot, scope: Scope::Full, res_ix: 1, mic_ix: 0, system_audio: false }
+    }
+}
+
 pub fn open_window(cx: &mut App) {
     open_window_with(LauncherState::default(), cx);
 }
 
-/// Reopen the pill with restored selections (after a region pick).
+/// The plain floating pill (small transparent window).
 pub fn open_window_with(state: LauncherState, cx: &mut App) {
     let bounds = Bounds::centered(None, Size { width: px(820.), height: px(280.) }, cx);
+    open_launcher(state, false, WindowBounds::Windowed(bounds), cx);
+}
+
+/// The live crop session (fullscreen transparent window, pill on top).
+pub fn open_crop_session(state: LauncherState, cx: &mut App) {
+    let display = cx
+        .primary_display()
+        .map(|d| d.bounds())
+        .unwrap_or_else(|| Bounds::from_corners(Point::default(), Point::new(px(1920.), px(1080.))));
+    open_launcher(state, true, WindowBounds::Fullscreen(display), cx);
+}
+
+fn open_launcher(state: LauncherState, crop_session: bool, bounds: WindowBounds, cx: &mut App) {
     let window = cx.open_window(
         WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_bounds: Some(bounds),
             titlebar: None,
             window_background: WindowBackgroundAppearance::Transparent,
             is_resizable: false,
+            is_movable: !crop_session,
             ..Default::default()
         },
         |window, cx| {
-            let view = cx.new(|cx| LauncherView::new(state.clone(), window, cx));
+            let view = cx.new(|cx| LauncherView::new(state.clone(), crop_session, window, cx));
             let handle = view.read(cx).focus_handle.clone();
             window.focus(&handle, cx);
             window.on_window_should_close(cx, |_, cx| {
@@ -67,36 +112,6 @@ pub fn open_window_with(state: LauncherState, cx: &mut App) {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum Mode {
-    Screenshot,
-    Record,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum Scope {
-    Full,
-    Crop,
-}
-
-/// Snapshot of the pill's selections, carried through the crop-pick round
-/// trip (pill closes → freeze-frame picker → pill reopens with the region).
-#[derive(Clone)]
-pub struct LauncherState {
-    pub mode: Mode,
-    pub scope: Scope,
-    pub res_ix: usize,
-    pub mic_ix: usize,
-    /// Picked region in stream/image pixels.
-    pub crop: Option<(u32, u32, u32, u32)>,
-}
-
-impl Default for LauncherState {
-    fn default() -> Self {
-        Self { mode: Mode::Screenshot, scope: Scope::Full, res_ix: 1, mic_ix: 0, crop: None }
-    }
-}
-
 struct LauncherView {
     mode: Mode,
     scope: Scope,
@@ -105,13 +120,22 @@ struct LauncherView {
     mics: Vec<(Option<String>, SharedString)>,
     mic_ix: usize,
     mic_open: bool,
-    /// Region picked via the freeze-frame selector (stream pixels).
-    crop: Option<(u32, u32, u32, u32)>,
+    system_audio: bool,
+    /// Fullscreen live-selection mode.
+    crop_session: bool,
+    sel_start: Option<Point<Pixels>>,
+    sel_end: Option<Point<Pixels>>,
+    dragging: bool,
     focus_handle: FocusHandle,
 }
 
 impl LauncherView {
-    fn new(state: LauncherState, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        state: LauncherState,
+        crop_session: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut mics: Vec<(Option<String>, SharedString)> = vec![
             (None, "Don't record mic".into()),
             (Some("default".into()), "Default microphone".into()),
@@ -145,7 +169,11 @@ impl LauncherView {
             mics,
             mic_ix,
             mic_open,
-            crop: state.crop,
+            system_audio: state.system_audio,
+            crop_session,
+            sel_start: None,
+            sel_end: None,
+            dragging: false,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -156,45 +184,95 @@ impl LauncherView {
             scope: self.scope,
             res_ix: self.res_ix,
             mic_ix: self.mic_ix,
-            crop: self.crop,
+            system_audio: self.system_audio,
         }
     }
 
-    /// Crop segment: hide the pill and pick a region on a clean freeze-frame.
-    fn start_pick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Selection rect in window coords (min 3px each way).
+    fn sel_rect(&self) -> Option<(Pixels, Pixels, Pixels, Pixels)> {
+        let (a, b) = (self.sel_start?, self.sel_end?);
+        let x0 = a.x.min(b.x);
+        let y0 = a.y.min(b.y);
+        let x1 = a.x.max(b.x);
+        let y1 = a.y.max(b.y);
+        if f32::from(x1 - x0) < 3.0 || f32::from(y1 - y0) < 3.0 {
+            return None;
+        }
+        Some((x0, y0, x1 - x0, y1 - y0))
+    }
+
+    /// Selection mapped to stream/image pixels via the monitor's pixel size.
+    fn sel_to_stream(&self, viewport: Size<Pixels>) -> Option<(u32, u32, u32, u32)> {
+        let (x, y, w, h) = self.sel_rect()?;
+        let (mon_w, mon_h) = ashot_core::capture::monitors()
+            .ok()
+            .and_then(|m| m.first().map(|m| (m.pixel_w as f32, m.pixel_h as f32)))
+            .unwrap_or((f32::from(viewport.width), f32::from(viewport.height)));
+        let sx = mon_w / f32::from(viewport.width).max(1.0);
+        let sy = mon_h / f32::from(viewport.height).max(1.0);
+        Some((
+            (f32::from(x) * sx).round().max(0.0) as u32,
+            (f32::from(y) * sy).round().max(0.0) as u32,
+            ((f32::from(w) * sx).round() as u32).max(1),
+            ((f32::from(h) * sy).round() as u32).max(1),
+        ))
+    }
+
+    /// Crop segment: enter (or restart) the live crop session.
+    fn enter_crop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.crop_session {
+            // Already in session: clicking Crop clears the selection to redraw.
+            self.sel_start = None;
+            self.sel_end = None;
+            cx.notify();
+            return;
+        }
         let mut state = self.snapshot();
         state.scope = Scope::Crop;
         window.remove_window();
-        capture_then_overlay(
-            overlay::OverlayStart::Select(overlay::Purpose::PickRegion { state }),
-            cx,
-        );
+        cx.spawn(async move |_, cx| {
+            cx.update(|cx| open_crop_session(state, cx));
+        })
+        .detach();
     }
 
-    /// The red button: execute the selected combination. The region was
-    /// already picked when Crop was selected; execution uses a fresh capture
-    /// (screenshot) or the live stream (record) of that region.
+    /// Leave the crop session back to the plain pill.
+    fn leave_crop(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<Self>) {
+        let mut state = self.snapshot();
+        state.scope = scope;
+        window.remove_window();
+        cx.spawn(async move |_, cx| {
+            cx.update(|cx| open_window_with(state, cx));
+        })
+        .detach();
+    }
+
+    /// The red button. In a crop session this needs a selection; execution
+    /// closes our window first so it is never part of the result.
     fn fire(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let height = RESOLUTIONS[self.res_ix].1;
         let mic = self.mics[self.mic_ix].0.clone();
-        if self.scope == Scope::Crop && self.crop.is_none() {
-            // No region picked yet — pick first, then the user fires again.
-            self.start_pick(window, cx);
+        let crop = if self.crop_session {
+            match self.sel_to_stream(window.viewport_size()) {
+                Some(c) => Some(c),
+                None => return, // nothing selected yet — draw a region first
+            }
+        } else if self.scope == Scope::Crop {
+            // Crop armed without a session (edge case) — enter one instead.
+            self.enter_crop(window, cx);
             return;
-        }
+        } else {
+            None
+        };
         window.remove_window();
-        match (self.mode, self.scope) {
-            (Mode::Screenshot, Scope::Full) => {
+        match (self.mode, crop) {
+            (Mode::Screenshot, None) => {
                 capture_then_overlay(overlay::OverlayStart::PreviewFull, cx)
             }
-            (Mode::Screenshot, Scope::Crop) => capture_then_overlay(
-                overlay::OverlayStart::PreviewRegion(self.crop.expect("checked above")),
-                cx,
-            ),
-            (Mode::Record, Scope::Full) => start_recording_flow(None, Some(height), mic, cx),
-            (Mode::Record, Scope::Crop) => {
-                start_recording_flow(self.crop, Some(height), mic, cx)
+            (Mode::Screenshot, Some(rect)) => {
+                capture_then_overlay(overlay::OverlayStart::PreviewRegion(rect), cx)
             }
+            (Mode::Record, crop) => start_recording_flow(crop, Some(height), mic, self.system_audio, cx),
         }
     }
 
@@ -249,25 +327,20 @@ impl LauncherView {
             _ => format!("🎤 {}", truncate(&self.mics[self.mic_ix].1, 12)).into(),
         }
     }
-}
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{cut}…")
+    fn crop_label(&self, viewport: Size<Pixels>) -> SharedString {
+        if self.crop_session {
+            match self.sel_to_stream(viewport) {
+                Some((_, _, w, h)) => format!("Crop {w}×{h}").into(),
+                None => "Crop…".into(),
+            }
+        } else {
+            "Crop".into()
+        }
     }
-}
 
-impl Focusable for LauncherView {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl Render for LauncherView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The pill element (shared by the plain window and the crop session).
+    fn pill(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> gpui::Div {
         let record = self.mode == Mode::Record;
 
         let mut pill = div()
@@ -282,50 +355,51 @@ impl Render for LauncherView {
             .border_1()
             .border_color(theme::border())
             .shadow_lg()
-            // Mode toggle.
             .child(
                 self.seg_group()
-                    .child(self.segment(("mode", 0), "Screenshot".into(), !record, cx, |this, _, cx| {
-                        this.mode = Mode::Screenshot;
-                        this.mic_open = false;
-                        cx.notify();
-                    }))
+                    .child(self.segment(
+                        ("mode", 0),
+                        "Screenshot".into(),
+                        !record,
+                        cx,
+                        |this, _, cx| {
+                            this.mode = Mode::Screenshot;
+                            this.mic_open = false;
+                            cx.notify();
+                        },
+                    ))
                     .child(self.segment(("mode", 1), "⏺ Record".into(), record, cx, |this, _, cx| {
                         this.mode = Mode::Record;
                         cx.notify();
                     })),
             )
             .child(div().w(px(1.)).h(px(24.)).bg(theme::border()))
-            // Scope selector (both modes).
             .child(
                 self.seg_group()
                     .child(self.segment(
                         ("scope", 0),
                         "Full".into(),
-                        self.scope == Scope::Full,
+                        self.scope == Scope::Full && !self.crop_session,
                         cx,
-                        |this, _, cx| {
-                            this.scope = Scope::Full;
-                            cx.notify();
+                        |this, window, cx| {
+                            if this.crop_session {
+                                this.leave_crop(Scope::Full, window, cx);
+                            } else {
+                                this.scope = Scope::Full;
+                                cx.notify();
+                            }
                         },
                     ))
                     .child(self.segment(
                         ("scope", 1),
-                        // Show the picked region; clicking re-picks.
-                        match self.crop {
-                            Some((_, _, w, h)) if self.scope == Scope::Crop => {
-                                format!("Crop {w}×{h}").into()
-                            }
-                            _ => "Crop".into(),
-                        },
-                        self.scope == Scope::Crop,
+                        self.crop_label(viewport),
+                        self.scope == Scope::Crop || self.crop_session,
                         cx,
-                        |this, window, cx| this.start_pick(window, cx),
+                        |this, window, cx| this.enter_crop(window, cx),
                     )),
             );
 
         if record {
-            // Resolution selector.
             let mut res_group = self.seg_group();
             for ix in 0..RESOLUTIONS.len() {
                 let (label, ..) = RESOLUTIONS[ix];
@@ -342,7 +416,6 @@ impl Render for LauncherView {
                 ));
             }
             pill = pill.child(res_group).child(
-                // Mic picker chip.
                 div()
                     .id("mic")
                     .px_3()
@@ -364,10 +437,32 @@ impl Render for LauncherView {
                         }),
                     ),
             );
+            let sys = self.system_audio;
+            pill = pill.child(
+                div()
+                    .id("sysaudio")
+                    .px_3()
+                    .py_1()
+                    .flex_none()
+                    .rounded_full()
+                    .cursor(CursorStyle::PointingHand)
+                    .bg(theme::surface())
+                    .border_1()
+                    .border_color(if sys { theme::accent() } else { theme::border() })
+                    .text_sm()
+                    .text_color(if sys { theme::text() } else { theme::text_muted() })
+                    .child(if sys { "🔊 System" } else { "🔇 System" })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            this.system_audio = !this.system_audio;
+                            cx.notify();
+                        }),
+                    ),
+            );
         }
 
-        // The red button.
-        pill = pill.child(div().flex_1()).child(
+        pill.child(div().flex_1()).child(
             div()
                 .id("fire")
                 .w(px(40.))
@@ -383,7 +478,69 @@ impl Render for LauncherView {
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, window, cx| this.fire(window, cx)),
                 ),
-        );
+        )
+    }
+
+    fn mic_dropdown(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .mt_2()
+            .w(px(360.))
+            .flex()
+            .flex_col()
+            .p_1()
+            .rounded_lg()
+            .bg(theme::bg())
+            .border_1()
+            .border_color(theme::border())
+            .shadow_lg()
+            .occlude()
+            .children((0..self.mics.len()).map(|ix| {
+                let (_, label) = &self.mics[ix];
+                let active = self.mic_ix == ix;
+                div()
+                    .id(("mic-opt", ix))
+                    .px_3()
+                    .py_1p5()
+                    .rounded_md()
+                    .cursor(CursorStyle::PointingHand)
+                    .text_sm()
+                    .text_color(if active { gpui::rgb(0xffffff) } else { theme::text() })
+                    .when(active, |d| d.bg(theme::accent()))
+                    .when(!active, |d| d.hover(|s| s.bg(theme::surface_hover())))
+                    .child(label.clone())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            this.mic_ix = ix;
+                            this.mic_open = false;
+                            cx.notify();
+                        }),
+                    )
+            }))
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
+}
+
+impl Focusable for LauncherView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for LauncherView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let viewport = window.viewport_size();
+        let record = self.mode == Mode::Record;
+        // The pill blocks drag events from reaching the selection layer.
+        let pill = self.pill(viewport, cx).occlude();
 
         let mut root = div()
             .id("launcher")
@@ -391,54 +548,114 @@ impl Render for LauncherView {
             .flex()
             .flex_col()
             .items_center()
-            .pt_2()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 match ev.keystroke.key.as_str() {
+                    "escape" if this.crop_session => this.leave_crop(Scope::Full, window, cx),
                     "escape" => cx.quit(),
                     "enter" => this.fire(window, cx),
                     _ => {}
                 }
-            }))
-            .child(pill);
+            }));
 
-        if self.mic_open && record {
-            root = root.child(
-                div()
-                    .mt_2()
-                    .w(px(360.))
-                    .flex()
-                    .flex_col()
-                    .p_1()
-                    .rounded_lg()
-                    .bg(theme::bg())
-                    .border_1()
-                    .border_color(theme::border())
-                    .shadow_lg()
-                    .children((0..self.mics.len()).map(|ix| {
-                        let (_, label) = &self.mics[ix];
-                        let active = self.mic_ix == ix;
-                        div()
-                            .id(("mic-opt", ix))
-                            .px_3()
-                            .py_1p5()
-                            .rounded_md()
-                            .cursor(CursorStyle::PointingHand)
-                            .text_sm()
-                            .text_color(if active { gpui::rgb(0xffffff) } else { theme::text() })
-                            .when(active, |d| d.bg(theme::accent()))
-                            .when(!active, |d| d.hover(|s| s.bg(theme::surface_hover())))
-                            .child(label.clone())
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                    this.mic_ix = ix;
-                                    this.mic_open = false;
-                                    cx.notify();
-                                }),
-                            )
-                    })),
-            );
+        if self.crop_session {
+            root = root
+                .cursor(CursorStyle::Crosshair)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                        this.dragging = true;
+                        this.sel_start = Some(ev.position);
+                        this.sel_end = Some(ev.position);
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                    if this.dragging {
+                        this.sel_end = Some(ev.position);
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, ev: &MouseUpEvent, _, cx| {
+                        if this.dragging {
+                            this.dragging = false;
+                            this.sel_end = Some(ev.position);
+                            cx.notify();
+                        }
+                    }),
+                );
+
+            // Light scrim so the live desktop stays visible; the selection is
+            // a hole in it (four slabs).
+            match self.sel_rect() {
+                None => {
+                    root = root.child(div().absolute().inset_0().bg(theme::scrim()));
+                }
+                Some((x, y, w, h)) => {
+                    let right_x = x + w;
+                    let bottom_y = y + h;
+                    root = root
+                        .child(
+                            div().absolute().left_0().top_0().w(viewport.width).h(y).bg(theme::scrim()),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top(bottom_y)
+                                .w(viewport.width)
+                                .h(viewport.height - bottom_y)
+                                .bg(theme::scrim()),
+                        )
+                        .child(div().absolute().left_0().top(y).w(x).h(h).bg(theme::scrim()))
+                        .child(
+                            div()
+                                .absolute()
+                                .left(right_x)
+                                .top(y)
+                                .w(viewport.width - right_x)
+                                .h(h)
+                                .bg(theme::scrim()),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .left(x)
+                                .top(y)
+                                .w(w)
+                                .h(h)
+                                .border_2()
+                                .border_color(theme::accent()),
+                        );
+                }
+            }
+            // Pill floats near the top, above the scrim.
+            root = root.child(div().mt(px(24.)).child(pill));
+            if self.mic_open && record {
+                root = root.child(self.mic_dropdown(cx));
+            }
+            if self.sel_rect().is_none() {
+                root = root.child(
+                    div()
+                        .mt_2()
+                        .px_3()
+                        .py_1()
+                        .rounded_full()
+                        .bg(theme::surface())
+                        .border_1()
+                        .border_color(theme::border())
+                        .text_xs()
+                        .text_color(theme::text_muted())
+                        .child("Drag to choose the area · ● captures · Esc back"),
+                );
+            }
+        } else {
+            root = root.child(div().mt_2().child(pill));
+            if self.mic_open && record {
+                root = root.child(self.mic_dropdown(cx));
+            }
         }
 
         root
@@ -473,6 +690,7 @@ pub fn start_recording_flow(
     crop: Option<(u32, u32, u32, u32)>,
     height: Option<u32>,
     mic: Option<String>,
+    system_audio: bool,
     cx: &mut App,
 ) {
     cx.spawn(async move |cx| {
@@ -481,7 +699,13 @@ pub fn start_recording_flow(
         let started = cx
             .background_executor()
             .spawn(async move {
-                ashot_core::record::start_recording(RecordOptions { output: None, height, crop, mic })
+                ashot_core::record::start_recording(RecordOptions {
+                    output: None,
+                    height,
+                    crop,
+                    mic,
+                    system_audio,
+                })
             })
             .await;
         match started {

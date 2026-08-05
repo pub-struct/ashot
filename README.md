@@ -57,6 +57,7 @@ ashot record --resolution 720          # scale to 720p/1080p/1440p on the GPU
 ashot record --region 100,100,1280,720 # crop a region (stream pixels)
 ashot record --mic                     # + default microphone (AAC audio track)
 ashot record --mic alsa_input.usb-...  # a specific source (pactl list sources short)
+ashot record --system-audio            # + what you hear (default output's monitor)
 
 # Introspection
 ashot monitors                         # monitor layout as JSON
@@ -77,6 +78,12 @@ Encoding runs in a `gst-launch-1.0 -e` subprocess (stock GStreamer, no extra
 packages on most distros). The first recording shows the system source-picker
 once; the portal restore token is persisted (`~/.config/ashot/`) so later
 recordings — including agent-driven ones — start silently.
+
+While recording, a floating pill shows elapsed time with mic-mute,
+pause/resume (gap-free: paused time is absent from the file), Stop, and a
+grab handle to move it. Pause/mute need `python3-gi` + GStreamer typelibs
+(preinstalled on GNOME); without them recording still works, minus those two
+buttons.
 
 ### Overlay shortcuts
 Drag to select · **Enter** save (selection or full screen) · **C** copy ·

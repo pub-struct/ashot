@@ -28,6 +28,131 @@ pub const RESOLUTIONS: &[(&str, u32, u32)] =
 /// The pipewire fd is dup2'd onto this number in the child.
 const CHILD_FD: i32 = 3;
 
+/// GStreamer controller: runs the pipeline via python-gi and takes runtime
+/// commands on stdin (pause/resume/mute/unmute/stop). SIGINT also → EOS.
+/// Live-source pause is gap-free: GStreamer rebases running time on resume,
+/// so paused wall-time never reaches the file.
+const CONTROLLER_PY: &str = r#"
+import sys, signal, time, gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst, GLib
+
+Gst.init(None)
+pipeline = Gst.parse_launch(sys.argv[1])
+loop = GLib.MainLoop()
+exit_code = 0
+
+def quit_loop():
+    pipeline.set_state(Gst.State.NULL)
+    loop.quit()
+
+def on_msg(bus, msg):
+    global exit_code
+    if msg.type == Gst.MessageType.EOS:
+        quit_loop()
+    elif msg.type == Gst.MessageType.ERROR:
+        err, _ = msg.parse_error()
+        print('gst-error: ' + err.message, file=sys.stderr, flush=True)
+        exit_code = 1
+        quit_loop()
+
+bus = pipeline.get_bus()
+bus.add_signal_watch()
+bus.connect('message', on_msg)
+
+def send_eos(*_):
+    pipeline.send_event(Gst.Event.new_eos())
+
+signal.signal(signal.SIGINT, send_eos)
+vol = pipeline.get_by_name('vol')
+
+# Pause: probes on the gate elements drop buffers while paused and subtract
+# the accumulated paused time from every later timestamp — the encoder sees
+# one continuous timeline, so the paused stretch simply isn't in the file.
+# The pipeline itself never leaves PLAYING (portal live sources dislike
+# PAUSED), and stop-EOS always runs on a flowing pipeline.
+paused = False
+pause_started = 0
+gap = 0  # ns
+
+def make_probe():
+    def probe(_pad, info):
+        buf = info.get_buffer()
+        if buf is None:
+            return Gst.PadProbeReturn.OK
+        if paused:
+            return Gst.PadProbeReturn.DROP
+        if gap:
+            if buf.pts != Gst.CLOCK_TIME_NONE:
+                buf.pts = max(0, buf.pts - gap)
+            if buf.dts != Gst.CLOCK_TIME_NONE:
+                buf.dts = max(0, buf.dts - gap)
+        return Gst.PadProbeReturn.OK
+    return probe
+
+for name in ('vgate', 'agate'):
+    el = pipeline.get_by_name(name)
+    if el:
+        el.get_static_pad('src').add_probe(Gst.PadProbeType.BUFFER, make_probe())
+
+def set_paused(p):
+    global paused, pause_started, gap
+    if p and not paused:
+        pause_started = time.monotonic_ns()
+        paused = True
+    elif not p and paused:
+        gap += time.monotonic_ns() - pause_started
+        paused = False
+
+def on_stdin(_ch, _cond):
+    line = sys.stdin.readline()
+    if not line:
+        send_eos()
+        return False
+    cmd = line.strip()
+    if cmd == 'pause':
+        set_paused(True)
+    elif cmd == 'resume':
+        set_paused(False)
+    elif cmd == 'mute' and vol:
+        vol.set_property('mute', True)
+    elif cmd == 'unmute' and vol:
+        vol.set_property('mute', False)
+    elif cmd == 'stop':
+        send_eos()
+    return True
+
+GLib.io_add_watch(sys.stdin, GLib.IO_IN | GLib.IO_HUP, on_stdin)
+pipeline.set_state(Gst.State.PLAYING)
+loop.run()
+sys.exit(exit_code)
+"#;
+
+/// python3 + gi + Gst present? Cached; decides controller vs gst-launch mode.
+fn controller_available() -> bool {
+    use std::sync::OnceLock;
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        Command::new("python3")
+            .args(["-c", "import gi; gi.require_version('Gst','1.0'); from gi.repository import Gst"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+fn controller_script_path() -> Result<PathBuf> {
+    let dir = dirs::config_dir()
+        .ok_or_else(|| Error::Record("no config dir".into()))?
+        .join("ashot");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("controller.py");
+    std::fs::write(&path, CONTROLLER_PY)?;
+    Ok(path)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RecordOptions {
     /// Defaults to ~/Videos/Screencasts/rec-<timestamp>.mp4
@@ -39,17 +164,25 @@ pub struct RecordOptions {
     /// Microphone: None = no audio, Some("default") = default input,
     /// Some(name) = a specific PulseAudio/PipeWire source name.
     pub mic: Option<String>,
+    /// Also record system audio (the default output's monitor source).
+    pub system_audio: bool,
 }
 
 pub struct Recording {
     child: Child,
+    /// stdin of the controller subprocess (None in gst-launch fallback mode).
+    control: Option<std::process::ChildStdin>,
     stop_keeper: mpsc::Sender<()>,
     pub path: PathBuf,
     pub encoder: &'static str,
     pub out_width: u32,
     pub out_height: u32,
     pub has_audio: bool,
-    started: Instant,
+    paused: bool,
+    muted: bool,
+    /// Recorded time before the current segment (pause-aware elapsed).
+    accumulated: Duration,
+    segment_start: Instant,
 }
 
 struct PortalStream {
@@ -86,6 +219,7 @@ pub fn start_recording(opts: RecordOptions) -> Result<Recording> {
         .map_or(16_000, |(_, _, kbps)| *kbps);
 
     let gpu = gst_has_element("vah264enc");
+    let spawn_instant = Instant::now();
     let (encoder, mut child) = spawn_gst(
         &stream, &opts, &path, out_w, out_h, bitrate,
         if gpu { "vah264enc" } else { "x264enc" },
@@ -107,7 +241,7 @@ pub fn start_recording(opts: RecordOptions) -> Result<Recording> {
             let (keeper2, stream2) = open_portal_stream()?;
             let (enc, child2) =
                 spawn_gst(&stream2, &opts, &path, out_w, out_h, bitrate, "x264enc")?;
-            return finish_start(keeper2, child2, enc, path, out_w, out_h, opts.mic.is_some());
+            return finish_start(keeper2, child2, enc, path, out_w, out_h, opts.mic.is_some() || opts.system_audio, Instant::now());
         }
         Ok(Some(status)) => {
             return Err(Error::Record(format!("encoder exited at startup: {status}")));
@@ -115,27 +249,33 @@ pub fn start_recording(opts: RecordOptions) -> Result<Recording> {
         _ => (encoder, child),
     };
 
-    finish_start(keeper, child, encoder, path, out_w, out_h, opts.mic.is_some())
+    finish_start(keeper, child, encoder, path, out_w, out_h, opts.mic.is_some() || opts.system_audio, spawn_instant)
 }
 
 fn finish_start(
     keeper: mpsc::Sender<()>,
-    child: Child,
+    mut child: Child,
     encoder: &'static str,
     path: PathBuf,
     out_width: u32,
     out_height: u32,
     has_audio: bool,
+    started: Instant,
 ) -> Result<Recording> {
+    let control = child.stdin.take();
     Ok(Recording {
         child,
+        control,
         stop_keeper: keeper,
         path,
         encoder,
         out_width,
         out_height,
         has_audio,
-        started: Instant::now(),
+        paused: false,
+        muted: false,
+        accumulated: Duration::ZERO,
+        segment_start: Instant::now(),
     })
 }
 
@@ -153,8 +293,54 @@ impl Drop for Recording {
 }
 
 impl Recording {
+    /// Recorded time, excluding paused stretches.
     pub fn elapsed(&self) -> Duration {
-        self.started.elapsed()
+        if self.paused {
+            self.accumulated
+        } else {
+            self.accumulated + self.segment_start.elapsed()
+        }
+    }
+
+    /// Pause/resume/mute are available in controller mode only.
+    pub fn can_control(&self) -> bool {
+        self.control.is_some()
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.muted
+    }
+
+    fn send_command(&mut self, cmd: &str) -> Result<()> {
+        let Some(control) = self.control.as_mut() else {
+            return Err(Error::Record("recording is not controllable".into()));
+        };
+        writeln!(control, "{cmd}")
+            .and_then(|_| control.flush())
+            .map_err(|e| Error::Record(format!("controller command failed: {e}")))
+    }
+
+    pub fn toggle_pause(&mut self) -> Result<()> {
+        if self.paused {
+            self.send_command("resume")?;
+            self.segment_start = Instant::now();
+            self.paused = false;
+        } else {
+            self.send_command("pause")?;
+            self.accumulated += self.segment_start.elapsed();
+            self.paused = true;
+        }
+        Ok(())
+    }
+
+    pub fn set_muted(&mut self, muted: bool) -> Result<()> {
+        self.send_command(if muted { "mute" } else { "unmute" })?;
+        self.muted = muted;
+        Ok(())
     }
 
     /// True while the encoder subprocess is alive.
@@ -275,24 +461,40 @@ fn spawn_gst(
     if encoder == "vah264enc" {
         line += &format!(
             "! vapostproc ! video/x-raw(memory:VAMemory),format=NV12,width={out_w},height={out_h} \
+             ! identity name=vgate \
              ! vah264enc bitrate={bitrate_kbps} ! h264parse "
         );
     } else {
         line += &format!(
             "! videoconvert ! videoscale ! video/x-raw,format=I420,width={out_w},height={out_h} \
+             ! identity name=vgate \
              ! x264enc bitrate={bitrate_kbps} speed-preset=veryfast tune=zerolatency key-int-max=120 \
              ! h264parse "
         );
     }
     line += "! mux. ";
     line += &format!("mp4mux name=mux ! filesink location={} ", shell_safe(path)?);
-    if let Some(mic) = &opts.mic {
+    let system_monitor = if opts.system_audio { default_monitor_source() } else { None };
+    if opts.mic.is_some() || system_monitor.is_some() {
         if let Some(aac) = ["avenc_aac", "voaacenc"].iter().find(|e| gst_has_element(e)) {
-            let device = if mic == "default" { String::new() } else { format!(" device={mic}") };
+            // Mixer handles one or both sources; the valve implements pause.
             line += &format!(
-                "pulsesrc{device} ! queue ! audioconvert ! audioresample \
-                 ! {aac} bitrate=128000 ! aacparse ! mux. "
+                "audiomixer name=amix ! audioconvert ! audioresample \
+                 ! identity name=agate ! {aac} bitrate=128000 ! aacparse ! mux. "
             );
+            if let Some(mic) = &opts.mic {
+                let device =
+                    if mic == "default" { String::new() } else { format!(" device={mic}") };
+                line += &format!(
+                    "pulsesrc{device} ! queue ! audioconvert ! audioresample \
+                     ! volume name=vol ! amix. "
+                );
+            }
+            if let Some(monitor) = &system_monitor {
+                line += &format!(
+                    "pulsesrc device={monitor} ! queue ! audioconvert ! audioresample ! amix. "
+                );
+            }
         } else {
             eprintln!(
                 "{}",
@@ -304,12 +506,22 @@ fn spawn_gst(
     if std::env::var_os("ASHOT_DEBUG").is_some() {
         eprintln!("[ashot debug] pipeline: {line}");
     }
-    let mut args: Vec<String> = vec!["-e".into(), "-q".into()];
-    args.extend(split_launch_line(&line));
 
     let raw_fd = stream.fd.try_clone().map_err(|e| Error::Record(e.to_string()))?.into_raw_fd();
-    let mut cmd = Command::new("gst-launch-1.0");
-    cmd.args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut cmd;
+    if controller_available() {
+        // Controllable: python-gi runs the pipeline, commands over stdin.
+        let script = controller_script_path()?;
+        cmd = Command::new("python3");
+        cmd.arg(script).arg(&line);
+        // stderr passes through: gst-error lines land in our caller's stderr.
+        cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::inherit());
+    } else {
+        let mut args: Vec<String> = vec!["-e".into(), "-q".into()];
+        args.extend(split_launch_line(&line));
+        cmd = Command::new("gst-launch-1.0");
+        cmd.args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    }
     unsafe {
         cmd.pre_exec(move || {
             // dup2 clears O_CLOEXEC so the child inherits the pipewire fd.
@@ -344,6 +556,17 @@ fn shell_safe(path: &std::path::Path) -> Result<String> {
 
 fn even(v: u32) -> u32 {
     (v.max(2)) & !1
+}
+
+/// The default output's monitor source (system audio), e.g.
+/// `alsa_output.pci-....analog-stereo.monitor`.
+pub fn default_monitor_source() -> Option<String> {
+    let output = Command::new("pactl").arg("get-default-sink").output().ok()?;
+    let sink = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sink.is_empty() {
+        return None;
+    }
+    Some(format!("{sink}.monitor"))
 }
 
 /// Microphones (non-monitor PulseAudio/PipeWire sources): (name, description).

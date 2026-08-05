@@ -27,8 +27,6 @@ const DISMISS_AFTER: Duration = Duration::from_secs(6);
 pub enum Purpose {
     Screenshot,
     Record { height: u32, mic: Option<String> },
-    /// Pick a region and return to the launcher pill with it.
-    PickRegion { state: crate::launcher::LauncherState },
 }
 
 /// How the overlay starts.
@@ -177,7 +175,7 @@ impl OverlayView {
             (x.max(0) as u32, y.max(0) as u32, w, h)
         });
         window.remove_window();
-        crate::launcher::start_recording_flow(crop, Some(height), mic, cx);
+        crate::launcher::start_recording_flow(crop, Some(height), mic, false, cx);
     }
 
     /// Capture → clipboard → preview card, in one step (window-space input).
@@ -407,17 +405,7 @@ impl Render for OverlayView {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 match (this.phase, ev.keystroke.key.as_str()) {
-                    (_, "escape") => {
-                        // Cancelling a region pick returns to the pill.
-                        if let Purpose::PickRegion { mut state } = this.purpose.clone() {
-                            state.scope = crate::launcher::Scope::Full;
-                            state.crop = None;
-                            window.remove_window();
-                            crate::launcher::open_window_with(state, cx);
-                        } else {
-                            cx.quit();
-                        }
-                    }
+                    (_, "escape") => cx.quit(),
                     (Phase::Preview, "enter") | (Phase::Preview, "s") => this.save(cx),
                     (Phase::Preview, "e") => this.edit(window, cx),
                     (Phase::Idle, "enter") => match this.purpose.clone() {
@@ -425,7 +413,6 @@ impl Render for OverlayView {
                         Purpose::Record { height, mic } => {
                             this.start_record(None, height, mic, window, cx)
                         }
-                        Purpose::PickRegion { .. } => {}
                     },
                     _ => {}
                 }
@@ -468,12 +455,6 @@ impl Render for OverlayView {
                                 (Some(sel), Purpose::Record { height, mic }) => {
                                     this.start_record(Some(sel), height, mic, window, cx)
                                 }
-                                (Some(sel), Purpose::PickRegion { mut state }) => {
-                                    let (x, y, w, h) = this.selection_to_image(window, sel);
-                                    state.crop = Some((x.max(0) as u32, y.max(0) as u32, w, h));
-                                    window.remove_window();
-                                    crate::launcher::open_window_with(state, cx);
-                                }
                                 (None, _) => {
                                     this.phase = Phase::Idle;
                                     cx.notify();
@@ -514,9 +495,6 @@ impl Render for OverlayView {
                                 }
                                 Purpose::Record { .. } => {
                                     "Drag the area to record · Enter full screen · Esc cancel"
-                                }
-                                Purpose::PickRegion { .. } => {
-                                    "Drag to choose the area · Esc back"
                                 }
                             }),
                     );

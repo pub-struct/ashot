@@ -122,6 +122,19 @@ Rust with GPUI (Zed's UI framework).
   filtered out); default is no mic. Note: mp4mux silently omits a track that
   never produced samples (e.g. a sleeping bluetooth source) — picking an
   explicit device avoids it.
+- **System audio**: `--system-audio` / 🔊 chip = pulsesrc on the default
+  sink's `.monitor`; an `audiomixer` merges mic + system when both are on.
+- **Runtime control (pause/mute)**: pipeline runs under a python-gi
+  controller (`~/.config/ashot/controller.py`, embedded in the binary) taking
+  stdin commands; falls back to gst-launch (no pause/mute) without python-gi.
+  Pause NEVER sets the pipeline PAUSED (portal live sources wedge and EOS
+  breaks → unfinalized mp4, found empirically). Instead `identity` gates +
+  pad probes drop buffers while paused and subtract the accumulated gap from
+  every later PTS/DTS — continuous timeline, paused time absent from the
+  file, and stop-EOS always runs on a flowing pipeline. Verified: ~11 s wall
+  with 3 s paused → 8.1 s file.
+- **Recorder pill** (user-sketched): [● time] [🎤 mute] [⏸ pause] [■ Stop]
+  [⣿ grab → start_window_move]; Space = pause, M = mute, Esc/Enter = stop.
 
 ## Known risks / later
 - GPUI git-dep breakage on rev bumps (mitigated by pinning + crate isolation).
