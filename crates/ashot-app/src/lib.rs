@@ -8,6 +8,7 @@ pub mod launcher;
 pub mod overlay;
 pub mod recorder;
 pub mod theme;
+pub mod tray;
 pub mod timeline_media;
 
 use std::path::PathBuf;

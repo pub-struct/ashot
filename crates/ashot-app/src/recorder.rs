@@ -1,66 +1,92 @@
-//! Recording status pill (user-sketched design):
+//! Recording control.
 //!
-//!   [● TIME] [🎤 mute/unmute] [⏸ pause/resume] [■ Stop] [⣿ grab area]
+//! While recording, the primary UI is the system-tray icon (see
+//! `crate::tray`): pause/stop live in its menu, so nothing of the app is
+//! visible in the capture (Wayland/X11 have no per-window capture
+//! exclusion, unlike Windows/macOS).
 //!
-//! Pause/mute talk to the GStreamer controller subprocess; the grab area
-//! starts a compositor window move (the pill window has no titlebar).
+//! The status pill window
+//!
+//!   [● TIME] [🎤 mute/unmute] [⏸ pause/resume] [■ Stop] [🫥 hide] [⣿ grab]
+//!
+//! is NOT shown when recording starts — it opens on demand via the tray's
+//! "Show controls" (or a left-click on the icon) and can be dismissed again
+//! with 🫥. Only when no StatusNotifier host exists (e.g. GNOME without the
+//! AppIndicator extension) does the pill open right away, since it is then
+//! the only way to stop; in that fallback 🫥 minimizes instead of closing.
+//!
+//! `RecorderController` is an app-level (windowless) entity owning the
+//! recording, the tray handle, and the 1s ticker; the pill is a thin view
+//! over it.
 
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, App, Bounds, Context, CursorStyle, FocusHandle, Focusable, KeyDownEvent,
-    MouseButton, MouseDownEvent, SharedString, Size, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions,
+    div, prelude::*, px, App, Bounds, Context, CursorStyle, Entity, FocusHandle, Focusable,
+    KeyDownEvent, MouseButton, MouseDownEvent, SharedString, Size, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowHandle, WindowOptions,
 };
 
 use ashot_core::record::Recording;
 
 use crate::theme;
+use crate::tray::TrayCmd;
 
-pub fn open_window(recording: Recording, cx: &mut App) {
-    let bounds = Bounds::centered(None, Size { width: px(430.), height: px(72.) }, cx);
-    let window = cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: None,
-            window_background: WindowBackgroundAppearance::Transparent,
-            is_resizable: false,
-            ..Default::default()
-        },
-        |window, cx| {
-            let view = cx.new(|cx| RecorderView::new(recording, cx));
-            let handle = view.read(cx).focus_handle.clone();
-            window.focus(&handle, cx);
-            // Closing the pill = Stop: finalize instead of orphaning.
-            let close_view = view.clone();
-            window.on_window_should_close(cx, move |_, cx| {
-                close_view.update(cx, |this, cx| this.stop(cx));
-                false // stop() quits the app once the file is finalized
-            });
-            view
-        },
-    );
-    if window.is_err() {
-        eprintln!("failed to open recorder window");
-        cx.quit();
+pub fn start(recording: Recording, cx: &mut App) {
+    // ksni runs menu callbacks on its own service thread; a channel plus a
+    // pump on the UI side keeps the gpui entity single-threaded.
+    let (tray_tx, tray_rx) = std::sync::mpsc::channel::<TrayCmd>();
+    let tray = crate::tray::spawn(recording.can_control(), tray_tx);
+    let has_tray = tray.is_some();
+
+    let ctrl = cx.new(|cx| RecorderController::new(recording, tray, cx));
+
+    if has_tray {
+        let pump = ctrl.clone();
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(200)).await;
+                let alive = pump.update(cx, |this, cx| {
+                    while let Ok(cmd) = tray_rx.try_recv() {
+                        match cmd {
+                            TrayCmd::TogglePause => this.toggle_pause(cx),
+                            TrayCmd::Stop => this.stop(cx),
+                            TrayCmd::Show => this.show_pill(cx),
+                        }
+                    }
+                    !this.stopping
+                });
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    } else {
+        // No top-bar host: the pill is the only control surface.
+        ctrl.update(cx, |this, cx| this.show_pill(cx));
     }
 }
 
-struct RecorderView {
+struct RecorderController {
     recording: Option<Recording>,
-    encoder: &'static str,
     has_audio: bool,
     can_control: bool,
     elapsed_s: u64,
     stopping: bool,
-    focus_handle: FocusHandle,
+    tray: Option<ksni::blocking::Handle<crate::tray::RecordTray>>,
+    pill: Option<WindowHandle<RecorderView>>,
 }
 
-impl RecorderView {
-    fn new(recording: Recording, cx: &mut Context<Self>) -> Self {
-        let encoder = recording.encoder;
+impl RecorderController {
+    fn new(
+        recording: Recording,
+        tray: Option<ksni::blocking::Handle<crate::tray::RecordTray>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let has_audio = recording.has_audio;
         let can_control = recording.can_control();
+
         // Test hooks: ASHOT_TEST_AUTOSTOP=N stops after N recorded seconds;
         // ASHOT_TEST_PAUSE=A,B pauses at A and resumes at B (wall seconds).
         let auto_stop: Option<u64> =
@@ -81,7 +107,7 @@ impl RecorderView {
                     }
                     if let Some((pause_at, resume_at)) = test_pause {
                         if ticks == pause_at || ticks == resume_at {
-                            let _ = this.toggle_pause(cx);
+                            this.toggle_pause(cx);
                         }
                     }
                     if auto_stop.is_some_and(|limit| this.elapsed_s >= limit) {
@@ -110,14 +136,71 @@ impl RecorderView {
             }
         })
         .detach();
+
         Self {
             recording: Some(recording),
-            encoder,
             has_audio,
             can_control,
             elapsed_s: 0,
             stopping: false,
-            focus_handle: cx.focus_handle(),
+            tray,
+            pill: None,
+        }
+    }
+
+    fn is_paused(&self) -> bool {
+        self.recording.as_ref().is_some_and(|r| r.is_paused())
+    }
+
+    fn is_muted(&self) -> bool {
+        self.recording.as_ref().is_some_and(|r| r.is_muted())
+    }
+
+    /// Open the status pill, or raise it if it's already open.
+    fn show_pill(&mut self, cx: &mut Context<Self>) {
+        if let Some(pill) = self.pill {
+            if pill.update(cx, |_, window, _| window.activate_window()).is_ok() {
+                return;
+            }
+            self.pill = None;
+        }
+        let ctrl = cx.entity();
+        let bounds = Bounds::centered(None, Size { width: px(430.), height: px(72.) }, cx);
+        let pill = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: None,
+                window_background: WindowBackgroundAppearance::Transparent,
+                is_resizable: false,
+                ..Default::default()
+            },
+            |window, cx| {
+                // Deliberately no focus grab: the pill is a passive status
+                // window and shouldn't steal focus from whatever the user
+                // is recording. Keys work once the user clicks it.
+                let view = cx.new(|cx| RecorderView::new(ctrl.clone(), cx));
+                let close_ctrl = ctrl.clone();
+                window.on_window_should_close(cx, move |_, cx| {
+                    close_ctrl.update(cx, |this, cx| this.pill_should_close(cx))
+                });
+                view
+            },
+        );
+        match pill {
+            Ok(pill) => self.pill = Some(pill),
+            Err(_) => eprintln!("failed to open recorder window"),
+        }
+    }
+
+    /// With a tray, closing the pill just dismisses it (recording keeps
+    /// going); without one it's the only control, so closing means Stop.
+    fn pill_should_close(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.tray.is_some() && !self.stopping {
+            self.pill = None;
+            true
+        } else {
+            self.stop(cx);
+            false // stop() quits the app once the file is finalized
         }
     }
 
@@ -129,6 +212,10 @@ impl RecorderView {
                     serde_json::json!({ "warning": format!("pause failed: {e}") })
                 );
             }
+        }
+        let paused = self.is_paused();
+        if let Some(tray) = &self.tray {
+            tray.update(|t| t.paused = paused);
         }
         cx.notify();
     }
@@ -148,6 +235,9 @@ impl RecorderView {
 
     fn stop(&mut self, cx: &mut Context<Self>) {
         let Some(recording) = self.recording.take() else { return };
+        if let Some(tray) = self.tray.take() {
+            let _ = tray.shutdown();
+        }
         self.stopping = true;
         cx.notify();
         let encoder = recording.encoder;
@@ -174,6 +264,30 @@ impl RecorderView {
         })
         .detach();
     }
+}
+
+struct RecorderView {
+    ctrl: Entity<RecorderController>,
+    focus_handle: FocusHandle,
+}
+
+impl RecorderView {
+    fn new(ctrl: Entity<RecorderController>, cx: &mut Context<Self>) -> Self {
+        cx.observe(&ctrl, |_, _, cx| cx.notify()).detach();
+        Self { ctrl, focus_handle: cx.focus_handle() }
+    }
+
+    /// 🫥 — with a tray the pill closes outright (re-open from the top
+    /// bar); without one it only minimizes, so it stays reachable from the
+    /// taskbar/overview.
+    fn hide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ctrl.read(cx).tray.is_some() {
+            self.ctrl.update(cx, |this, _| this.pill = None);
+            window.remove_window();
+        } else {
+            window.minimize_window();
+        }
+    }
 
     fn chip(
         &self,
@@ -181,7 +295,7 @@ impl RecorderView {
         label: SharedString,
         active: bool,
         cx: &mut Context<Self>,
-        handler: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        handler: impl Fn(&mut RecorderController, &mut Context<RecorderController>) + 'static,
     ) -> impl IntoElement {
         div()
             .id(id)
@@ -199,7 +313,9 @@ impl RecorderView {
             .child(label)
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _: &MouseDownEvent, _, cx| handler(this, cx)),
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    this.ctrl.update(cx, |ctrl, cx| handler(ctrl, cx));
+                }),
             )
     }
 }
@@ -212,14 +328,16 @@ impl Focusable for RecorderView {
 
 impl Render for RecorderView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (elapsed_s, stopping, has_audio, can_control, paused, muted) = {
+            let c = self.ctrl.read(cx);
+            (c.elapsed_s, c.stopping, c.has_audio, c.can_control, c.is_paused(), c.is_muted())
+        };
         let elapsed = format!(
             "{:02}:{:02}:{:02}",
-            self.elapsed_s / 3600,
-            (self.elapsed_s % 3600) / 60,
-            self.elapsed_s % 60
+            elapsed_s / 3600,
+            (elapsed_s % 3600) / 60,
+            elapsed_s % 60
         );
-        let paused = self.recording.as_ref().is_some_and(|r| r.is_paused());
-        let muted = self.recording.as_ref().is_some_and(|r| r.is_muted());
 
         let mut pill = div()
             .flex()
@@ -252,7 +370,7 @@ impl Render for RecorderView {
                         div()
                             .text_lg()
                             .text_color(if paused { theme::text_muted() } else { theme::text() })
-                            .child(if self.stopping {
+                            .child(if stopping {
                                 SharedString::from("Saving…")
                             } else {
                                 SharedString::from(elapsed)
@@ -261,24 +379,24 @@ impl Render for RecorderView {
             );
 
         // 🎤 mute/unmute (only when recording audio and controllable)
-        if self.has_audio && self.can_control {
+        if has_audio && can_control {
             pill = pill.child(self.chip(
                 "mute",
                 if muted { "🎤 Muted".into() } else { "🎤 On".into() },
                 muted,
                 cx,
-                |this, cx| this.toggle_mute(cx),
+                |ctrl, cx| ctrl.toggle_mute(cx),
             ));
         }
 
         // ⏸ pause/resume
-        if self.can_control {
+        if can_control {
             pill = pill.child(self.chip(
                 "pause",
                 if paused { "▶ Resume".into() } else { "⏸ Pause".into() },
                 paused,
                 cx,
-                |this, cx| this.toggle_pause(cx),
+                |ctrl, cx| ctrl.toggle_pause(cx),
             ));
         }
 
@@ -296,10 +414,36 @@ impl Render for RecorderView {
                     .text_color(gpui::rgb(0xffffff))
                     .text_sm()
                     .hover(|s| s.bg(theme::accent_hover()))
-                    .child(if self.stopping { "Saving…" } else { "■ Stop" })
+                    .child(if stopping { "Saving…" } else { "■ Stop" })
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, _, cx| this.stop(cx)),
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            this.ctrl.update(cx, |ctrl, cx| ctrl.stop(cx));
+                        }),
+                    ),
+            )
+            // 🫥 hide — dismiss the pill so it doesn't appear in the
+            // recording; bring it back from the tray icon.
+            .child(
+                div()
+                    .id("hide")
+                    .px_3()
+                    .py_1()
+                    .flex_none()
+                    .rounded_full()
+                    .cursor(CursorStyle::PointingHand)
+                    .bg(theme::surface())
+                    .border_1()
+                    .border_color(theme::border())
+                    .text_sm()
+                    .text_color(theme::text_muted())
+                    .hover(|s| s.bg(theme::surface_hover()))
+                    .child("🫥 Hide")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.hide(window, cx);
+                        }),
                     ),
             )
             // ⣿ grab area — drag to move the pill anywhere.
@@ -329,11 +473,12 @@ impl Render for RecorderView {
             .justify_center()
             .items_start()
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 match ev.keystroke.key.as_str() {
-                    "escape" | "enter" => this.stop(cx),
-                    "space" => this.toggle_pause(cx),
-                    "m" => this.toggle_mute(cx),
+                    "escape" | "enter" => this.ctrl.update(cx, |ctrl, cx| ctrl.stop(cx)),
+                    "space" => this.ctrl.update(cx, |ctrl, cx| ctrl.toggle_pause(cx)),
+                    "m" => this.ctrl.update(cx, |ctrl, cx| ctrl.toggle_mute(cx)),
+                    "h" => this.hide(window, cx),
                     _ => {}
                 }
             }))

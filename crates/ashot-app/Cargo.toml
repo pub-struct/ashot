@@ -14,3 +14,4 @@ image.workspace = true
 serde_json.workspace = true
 smallvec.workspace = true
 tiny-skia.workspace = true
+ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }

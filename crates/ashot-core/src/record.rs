@@ -21,9 +21,12 @@ use ashpd::desktop::PersistMode;
 
 use crate::error::{Error, Result};
 
-/// (label, target height, H.264 bitrate in kbps) — bitrates tuned for screen content.
+/// (label, target height, H.264 bitrate in kbps). Screen content is mostly
+/// sharp text/edges, which H.264 (especially the hardware encoders) smears at
+/// "camera video" bitrates — so these run high; sizes stay reasonable because
+/// static regions cost almost nothing.
 pub const RESOLUTIONS: &[(&str, u32, u32)] =
-    &[("720p", 720, 6_000), ("1080p", 1080, 10_000), ("1440p", 1440, 16_000)];
+    &[("720p", 720, 8_000), ("1080p", 1080, 16_000), ("1440p", 1440, 24_000)];
 
 /// The pipewire fd is dup2'd onto this number in the child.
 const CHILD_FD: i32 = 3;
@@ -234,7 +237,7 @@ pub fn start_recording(opts: RecordOptions) -> Result<Recording> {
     let bitrate = RESOLUTIONS
         .iter()
         .find(|(_, h, _)| *h >= out_h)
-        .map_or(16_000, |(_, _, kbps)| *kbps);
+        .map_or(32_000, |(_, _, kbps)| *kbps);
 
     // Startup can die transiently (GPU format negotiation, driver quirks, and
     // a latency-negotiation race between the audio branches and the mixer in

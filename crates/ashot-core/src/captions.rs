@@ -107,8 +107,11 @@ pub fn generate(input: &Path, srt_out: &Path, mut progress: impl FnMut(&str)) ->
     params.set_print_progress(false);
     params.set_print_special(false);
     params.set_print_realtime(false);
-    let threads = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4);
-    params.set_n_threads(threads.min(8));
+    // Cap at roughly half the available cores so the editor's per-frame preview
+    // decode (a subprocess per frame) isn't starved while whisper is running.
+    let total_threads = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4);
+    let threads = (total_threads / 2).clamp(1, 8);
+    params.set_n_threads(threads);
 
     state
         .full(params, &samples)

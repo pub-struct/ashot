@@ -62,7 +62,15 @@ pub struct LauncherState {
 
 impl Default for LauncherState {
     fn default() -> Self {
-        Self { mode: Mode::Screenshot, scope: Scope::Full, res_ix: 1, mic_ix: 0, system_audio: false }
+        // `res_ix == RESOLUTIONS.len()` is the virtual "Native" entry (no
+        // downscale) — the default, so a 2K/4K screen records at full detail.
+        Self {
+            mode: Mode::Screenshot,
+            scope: Scope::Full,
+            res_ix: RESOLUTIONS.len(),
+            mic_ix: 0,
+            system_audio: false,
+        }
     }
 }
 
@@ -313,7 +321,7 @@ impl LauncherView {
     /// The red button. In a crop session this needs a selection; execution
     /// closes our window first so it is never part of the result.
     fn fire(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let height = RESOLUTIONS[self.res_ix].1;
+        let height = RESOLUTIONS.get(self.res_ix).map(|(_, h, _)| *h);
         let mic = self.mics[self.mic_ix].0.clone();
         let crop = if self.crop_session {
             match self.sel_to_stream(window.viewport_size()) {
@@ -337,7 +345,7 @@ impl LauncherView {
             (Mode::Screenshot, Some(rect)) => {
                 capture_then_overlay(overlay::OverlayStart::PreviewRegion(rect), cx)
             }
-            (Mode::Record, crop) => start_recording_flow(crop, Some(height), mic, self.system_audio, cx),
+            (Mode::Record, crop) => start_recording_flow(crop, height, mic, self.system_audio, cx),
         }
     }
 
@@ -467,9 +475,17 @@ impl LauncherView {
 
         if record {
             let mut res_group = self.seg_group();
-            for ix in 0..RESOLUTIONS.len() {
-                let (label, ..) = RESOLUTIONS[ix];
-                let label = if ix == 2 { "2K" } else { label };
+            for ix in 0..=RESOLUTIONS.len() {
+                let label = match RESOLUTIONS.get(ix) {
+                    Some((label, ..)) => {
+                        if ix == 2 {
+                            "2K"
+                        } else {
+                            label
+                        }
+                    }
+                    None => "Native",
+                };
                 res_group = res_group.child(self.segment(
                     ("res", ix),
                     label.into(),
@@ -933,7 +949,7 @@ pub fn start_recording_flow(
             })
             .await;
         match started {
-            Ok(recording) => cx.update(|cx| recorder::open_window(recording, cx)),
+            Ok(recording) => cx.update(|cx| recorder::start(recording, cx)),
             Err(e) => {
                 eprintln!(
                     "{}",

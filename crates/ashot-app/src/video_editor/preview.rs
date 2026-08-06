@@ -72,10 +72,16 @@ impl VideoEditor {
         Some((x, y))
     }
 
-    /// Burn current annotations (+typing preview) onto the frame for display.
+    /// Rebuild the annotation overlay (+typing preview): annotations burned
+    /// onto a transparent native-resolution image that `render()` layers over
+    /// the streamed video frame with the same layout transform. Streamed
+    /// frames are preview-scaled, so annotations can't be burned into them
+    /// directly (coords are in native video pixels) — and this way frame
+    /// updates never pay for annotation rendering, nor vice versa. Live zoom
+    /// is likewise NOT applied here: `render()` scales/offsets both layers at
+    /// layout time from `state::crop_rect_for` (the shared port of the export
+    /// math).
     pub(super) fn refresh_display(&mut self, cx: &mut Context<Self>) {
-        let Some(base) = &self.frame_native else { return };
-        let mut shown = base.clone();
         let mut all = self.state.annotations.clone();
         if let Some((x, y, text)) = &self.typing {
             all.push(Annotation::Text {
@@ -86,14 +92,14 @@ impl VideoEditor {
                 style: self.style(),
             });
         }
-        if !all.is_empty() {
-            let _ = self.renderer.render(&mut shown, &all);
-        }
-        // Live zoom is NOT applied here: `render()` scales/offsets this full
-        // frame at layout time from `state::crop_rect_for` (the shared port
-        // of the export math), so zoom drags never pay a per-event pixmap
-        // clone + crop + texture re-upload.
-        self.frame = Some(crate::img::into_render_image(shown));
+        self.overlay_frame = if all.is_empty() {
+            None
+        } else {
+            tiny_skia::Pixmap::new(self.info.width, self.info.height).map(|mut pm| {
+                let _ = self.renderer.render(&mut pm, &all);
+                crate::img::into_render_image(pm)
+            })
+        };
         cx.notify();
     }
 

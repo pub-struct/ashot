@@ -1,9 +1,11 @@
 //! Video editor: timeline scrubbing, cuts, drawings, smooth zoom points,
 //! AI captions, and GPU export.
 //!
-//! Layout: toolbar (top) / preview (middle) / timeline (bottom). Heavy work
-//! (frame decode, whisper, export) runs on the background executor via the
-//! core helpers; the UI only ever touches decoded frames.
+//! Layout: toolbar (top) / preview (middle) / timeline (bottom). Preview
+//! frames stream from a persistent GStreamer player process
+//! (`ashot_core::player`) at source framerate; other heavy work (whisper,
+//! export) runs on the background executor via the core helpers. The UI only
+//! ever touches decoded frames.
 
 mod inspector;
 mod preview;
@@ -23,6 +25,7 @@ use gpui::{
 };
 use tiny_skia::Pixmap;
 
+use ashot_core::player::{PlayerEvent, PreviewPlayer};
 use ashot_core::spec::Style;
 use ashot_core::video::{self, VideoInfo};
 use ashot_core::Renderer;
@@ -119,12 +122,17 @@ struct VideoEditor {
     path: PathBuf,
     info: VideoInfo,
     playhead: f64,
-    /// Latest decoded frame at native resolution (no annotations).
-    frame_native: Option<Pixmap>,
-    /// Displayed frame (annotations burned for preview).
+    /// Persistent streaming decoder (`None` if it failed to spawn).
+    player: Option<PreviewPlayer>,
+    /// Frames/EOS/errors from the player's reader thread, drained by the
+    /// pump task spawned in `new`.
+    player_rx: std::sync::mpsc::Receiver<PlayerEvent>,
+    /// Latest streamed frame, preview-scaled (no annotations).
     frame: Option<Arc<RenderImage>>,
-    fetch_in_flight: bool,
-    fetch_queued: bool,
+    /// Annotations (+ typing caret) burned onto a transparent native-res
+    /// image, layered over `frame` at render time. Rebuilt only when
+    /// annotations change, never per frame.
+    overlay_frame: Option<Arc<RenderImage>>,
     playing: bool,
 
     /// Cuts, zoom points, annotations, caption-burn toggle — the undoable
@@ -147,6 +155,13 @@ struct VideoEditor {
 
     srt: Option<PathBuf>,
     cc_status: Option<SharedString>,
+    /// Set while a caption-generation task is in flight; drives the status
+    /// ticker below and stops it once the task completes.
+    cc_running: bool,
+    /// Latest progress line from `ashot_core::captions::generate`, written
+    /// from the background task and polled by the ticker in
+    /// `generate_captions`.
+    cc_progress: Arc<Mutex<String>>,
 
     exporting: bool,
     export_progress: Arc<Mutex<f64>>,
@@ -178,14 +193,26 @@ impl VideoEditor {
     fn new(path: PathBuf, info: VideoInfo, cx: &mut Context<Self>) -> Self {
         let state = EditState::new(info.duration_s);
         let history = History::new(state.clone());
+        // Stream at native resolution: the preview must stay pixel-true and
+        // zoom (a layout transform, up to 8×) magnifies the texture, so any
+        // downscale here reads as blur. Native 1080p60 RGBA over the pipe is
+        // well within budget, and appsink drops frames if the UI falls behind.
+        let (player_tx, player_rx) = std::sync::mpsc::channel();
+        let player = match PreviewPlayer::spawn(&path, 0, player_tx) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("preview player failed: {e}");
+                None
+            }
+        };
         let mut this = Self {
             path,
             info,
             playhead: 0.0,
-            frame_native: None,
+            player,
+            player_rx,
             frame: None,
-            fetch_in_flight: false,
-            fetch_queued: false,
+            overlay_frame: None,
             playing: false,
             state,
             history,
@@ -199,6 +226,8 @@ impl VideoEditor {
             renderer: Renderer::new(),
             srt: None,
             cc_status: None,
+            cc_running: false,
+            cc_progress: Arc::new(Mutex::new(String::new())),
             exporting: false,
             export_progress: Arc::new(Mutex::new(0.0)),
             status: None,
@@ -217,7 +246,10 @@ impl VideoEditor {
         if sidecar.exists() {
             this.srt = Some(sidecar);
         }
-        this.fetch_frame(cx);
+        if this.player.is_none() {
+            this.status = Some("Preview unavailable: player failed to start".into());
+        }
+        this.spawn_player_pump(cx);
         this.load_timeline_media(cx);
         this.reload_cues(cx);
         this
@@ -299,38 +331,84 @@ impl VideoEditor {
 
     // ---- frames ----
 
-    fn fetch_frame(&mut self, cx: &mut Context<Self>) {
-        // Extraction spawns a subprocess and can outlast a playback tick
-        // (120ms). Keep exactly one extraction in flight and always display
-        // what it returns; if the playhead moved meanwhile, chain the next
-        // fetch. Dropping stale frames instead (the old generation-counter
-        // approach) starved the display during playback and scrubbing.
-        if self.fetch_in_flight {
-            self.fetch_queued = true;
-            return;
+    /// Show the frame at the playhead: flush-seek the persistent player.
+    /// While paused the pipeline prerolls and emits exactly that frame;
+    /// while playing, playback continues from the new position. The frame
+    /// itself arrives asynchronously via the pump.
+    fn fetch_frame(&mut self, _cx: &mut Context<Self>) {
+        if let Some(p) = self.player.as_mut() {
+            p.seek(self.playhead);
         }
-        self.fetch_in_flight = true;
-        let path = self.path.clone();
-        let t = self.playhead;
+    }
+
+    /// Drain player events onto the entity ~60×/s. A timer-driven pump (like
+    /// the export/CC progress tickers) keeps the mpsc receiver off the async
+    /// executor; draining keeps only the newest frame so a slow UI never
+    /// falls behind the stream.
+    fn spawn_player_pump(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let frame = cx
-                .background_executor()
-                .spawn(async move { video::extract_frame(&path, t) })
-                .await;
-            this.update(cx, |this, cx| {
-                this.fetch_in_flight = false;
-                if let Ok(pixmap) = frame {
-                    this.frame_native = Some(pixmap);
-                    this.refresh_display(cx);
+            loop {
+                cx.background_executor().timer(Duration::from_millis(16)).await;
+                if this.update(cx, |this, cx| this.pump_player(cx)).is_err() {
+                    break;
                 }
-                if this.fetch_queued || this.playhead != t {
-                    this.fetch_queued = false;
-                    this.fetch_frame(cx);
-                }
-            })
-            .ok();
+            }
         })
         .detach();
+    }
+
+    fn pump_player(&mut self, cx: &mut Context<Self>) {
+        let mut latest: Option<(f64, Pixmap)> = None;
+        let mut eos = false;
+        let mut error: Option<String> = None;
+        while let Ok(ev) = self.player_rx.try_recv() {
+            match ev {
+                PlayerEvent::Frame { t, pixmap } => latest = Some((t, pixmap)),
+                PlayerEvent::Eos => eos = true,
+                PlayerEvent::Error(e) => error = Some(e),
+            }
+        }
+        if let Some((t, pixmap)) = latest {
+            self.frame = Some(crate::img::into_render_image(pixmap));
+            if self.playing {
+                // The playhead follows the stream during playback; removed
+                // segments are skipped by seeking over them (adjacent removed
+                // segments in one hop).
+                let mut target = t;
+                while let Some(seg) = self
+                    .state
+                    .segments
+                    .iter()
+                    .find(|s| s.removed && target >= s.start && target < s.end)
+                {
+                    target = seg.end;
+                }
+                if target >= self.info.duration_s {
+                    eos = true;
+                } else {
+                    self.playhead = target;
+                    if target != t {
+                        if let Some(p) = self.player.as_mut() {
+                            p.seek(target);
+                        }
+                    }
+                }
+            }
+            cx.notify();
+        }
+        if eos {
+            self.playing = false;
+            self.playhead = 0.0;
+            if let Some(p) = self.player.as_mut() {
+                p.pause();
+                p.seek(0.0);
+            }
+            cx.notify();
+        }
+        if let Some(e) = error {
+            self.status = Some(format!("Preview error: {e}").into());
+            cx.notify();
+        }
     }
 
     fn style(&self) -> Style {
@@ -344,40 +422,27 @@ impl VideoEditor {
     // ---- playback ----
 
     fn toggle_play(&mut self, cx: &mut Context<Self>) {
+        let Some(_) = self.player.as_ref() else { return };
         self.playing = !self.playing;
         if self.playing {
-            let step = 0.25;
-            cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor().timer(Duration::from_millis(120)).await;
-                    let advanced = this.update(cx, |this, cx| {
-                        if !this.playing {
-                            return false;
-                        }
-                        let mut t = this.playhead + step;
-                        // Skip removed ranges during playback (adjacent removed
-                        // segments must be skipped in one hop).
-                        while let Some(seg) =
-                            this.state.segments.iter().find(|s| s.removed && t >= s.start && t < s.end)
-                        {
-                            t = seg.end;
-                        }
-                        if t >= this.info.duration_s {
-                            this.playing = false;
-                            this.playhead = 0.0;
-                        } else {
-                            this.playhead = t;
-                        }
-                        this.fetch_frame(cx);
-                        cx.notify();
-                        this.playing
-                    });
-                    if !matches!(advanced, Ok(true)) {
-                        break;
-                    }
-                }
-            })
-            .detach();
+            // Restart from 0 at the end; never start inside a removed range.
+            let mut t = if self.playhead >= self.info.duration_s - 0.05 { 0.0 } else { self.playhead };
+            while let Some(seg) =
+                self.state.segments.iter().find(|s| s.removed && t >= s.start && t < s.end)
+            {
+                t = seg.end;
+            }
+            if t >= self.info.duration_s {
+                t = 0.0;
+            }
+            let p = self.player.as_mut().unwrap();
+            if t != self.playhead {
+                self.playhead = t;
+                p.seek(t);
+            }
+            p.play();
+        } else if let Some(p) = self.player.as_mut() {
+            p.pause();
         }
         cx.notify();
     }
@@ -434,32 +499,46 @@ impl VideoEditor {
             return;
         }
         self.cc_status = Some("CC: starting…".into());
+        self.cc_running = true;
+        *self.cc_progress.lock().unwrap() = "starting…".to_string();
         let input = self.path.clone();
         let srt_path = self.path.with_extension("srt");
+        let progress = self.cc_progress.clone();
+
+        // Status ticker: mirrors export()'s progress loop, since whisper
+        // reports progress via a callback (not an async stream) and the
+        // reader here just needs to poll it periodically.
         cx.spawn(async move |this, cx| {
-            let (tx, rx) = std::sync::mpsc::channel::<String>();
-            let srt_out = srt_path.clone();
-            let task = cx.background_executor().spawn(async move {
-                ashot_core::captions::generate(&input, &srt_out, |s| {
-                    let _ = tx.send(s.to_string());
-                })
-            });
-            // Relay status lines while whisper runs.
-            let relay = {
-                let this = this.clone();
-                async move |cx: &mut gpui::AsyncApp| {
-                    while let Ok(msg) = rx.recv() {
-                        let _ = this.update(cx, |this: &mut Self, cx| {
-                            this.cc_status = Some(format!("CC: {msg}").into());
-                            cx.notify();
-                        });
+            loop {
+                cx.background_executor().timer(Duration::from_millis(400)).await;
+                let live = this.update(cx, |this: &mut Self, cx| {
+                    if this.cc_running {
+                        let msg = this.cc_progress.lock().unwrap().clone();
+                        this.cc_status = Some(format!("CC: {msg}").into());
+                        cx.notify();
                     }
+                    this.cc_running
+                });
+                if !matches!(live, Ok(true)) {
+                    break;
                 }
-            };
-            // Poll channel with timers (recv blocks; do it on background too).
-            let _ = relay; // status relayed post-hoc below to keep this simple
-            let result = task.await;
+            }
+        })
+        .detach();
+
+        cx.spawn(async move |this, cx| {
+            let progress2 = progress.clone();
+            let srt_out = srt_path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    ashot_core::captions::generate(&input, &srt_out, |s| {
+                        *progress2.lock().unwrap() = s.to_string();
+                    })
+                })
+                .await;
             this.update(cx, |this, cx| {
+                this.cc_running = false;
                 match result {
                     Ok(()) => {
                         this.srt = Some(srt_path.clone());
@@ -809,6 +888,18 @@ impl Render for VideoEditor {
                     .w(px(iw))
                     .h(px(ih)),
             );
+            // Annotations layer: native-res transparent image stacked with
+            // the exact same transform as the (preview-scaled) video frame.
+            if let Some(overlay) = &self.overlay_frame {
+                preview_col = preview_col.child(
+                    img(overlay.clone())
+                        .absolute()
+                        .left(px(ix))
+                        .top(px(iy))
+                        .w(px(iw))
+                        .h(px(ih)),
+                );
+            }
         }
         // Input layer over the preview.
         preview_col = preview_col.child(
@@ -895,6 +986,40 @@ impl Render for VideoEditor {
                         .border_2()
                         .border_color(theme::accent())
                         .cursor(CursorStyle::PointingHand),
+                );
+            }
+        }
+
+        // Live caption burn-in preview — pure text overlay (no pixmap work,
+        // same philosophy as the live-zoom layout transform above). Mirrors
+        // what `export` bakes into the frames when `burn_cc` is on.
+        if self.state.burn_cc {
+            if let Some(cue) = self
+                .cues
+                .iter()
+                .find(|c| c.start_s <= self.playhead && self.playhead < c.end_s)
+            {
+                preview_col = preview_col.child(
+                    div()
+                        .absolute()
+                        .left(px(ox))
+                        .top(px(oy + dh - 32.0))
+                        .w(px(dw))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .child(
+                            div()
+                                .max_w(px(dw * 0.8))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(gpui::rgba(0x00000099))
+                                .text_sm()
+                                .text_center()
+                                .text_color(gpui::white())
+                                .child(cue.text.clone()),
+                        ),
                 );
             }
         }

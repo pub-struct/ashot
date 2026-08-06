@@ -10,6 +10,7 @@ pub mod clipboard;
 pub mod error;
 pub mod micmon;
 pub mod paths;
+pub mod player;
 pub mod record;
 pub mod srt;
 pub mod video;
