@@ -44,7 +44,7 @@ pub fn ensure_model(mut progress: impl FnMut(&str)) -> Result<PathBuf> {
 }
 
 /// Decode any input's audio to 16 kHz mono s16 wav (whisper's input format).
-fn extract_wav(input: &Path, wav: &Path) -> Result<()> {
+pub(crate) fn extract_wav(input: &Path, wav: &Path) -> Result<()> {
     let status = Command::new("gst-launch-1.0")
         .args(["-q", "filesrc"])
         .arg(format!("location={}", input.display()))

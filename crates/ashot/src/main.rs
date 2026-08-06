@@ -90,6 +90,10 @@ enum Command {
         /// Also record system audio (what you hear).
         #[arg(long)]
         system_audio: bool,
+        /// Disable webrtcdsp voice processing (noise suppression/AGC) on the
+        /// mic; use the plain, unprocessed mic chain instead.
+        #[arg(long)]
+        no_voice_process: bool,
     },
     /// Generate English captions (SRT) with AI (whisper base.en).
     Captions {
@@ -139,8 +143,8 @@ fn main() {
         Command::Annotate { input, spec, output, clipboard, keep_spec } => {
             cmd_annotate(input, spec, output, clipboard, keep_spec)
         }
-        Command::Record { output, resolution, duration, region, mic, system_audio } => {
-            cmd_record(output, resolution, duration, region, mic, system_audio)
+        Command::Record { output, resolution, duration, region, mic, system_audio, no_voice_process } => {
+            cmd_record(output, resolution, duration, region, mic, system_audio, no_voice_process)
         }
         Command::Captions { input, output } => cmd_captions(input, output),
         Command::Export { input, output, keep, zoom, srt, overlay } => {
@@ -333,6 +337,7 @@ fn cmd_record(
     region: Option<String>,
     mic: Option<String>,
     system_audio: bool,
+    no_voice_process: bool,
 ) -> anyhow::Result<()> {
     use std::sync::atomic::Ordering;
 
@@ -351,7 +356,14 @@ fn cmd_record(
         None => None,
     };
 
-    let recording = ashot_record_start(ashot_core_opts(output, resolution, crop, mic, system_audio))?;
+    let recording = ashot_record_start(ashot_core_opts(
+        output,
+        resolution,
+        crop,
+        mic,
+        system_audio,
+        !no_voice_process,
+    ))?;
     eprintln!(
         "{}",
         json!({
@@ -409,8 +421,16 @@ fn ashot_core_opts(
     crop: Option<(u32, u32, u32, u32)>,
     mic: Option<String>,
     system_audio: bool,
+    voice_process: bool,
 ) -> ashot_core::record::RecordOptions {
-    ashot_core::record::RecordOptions { output, height: resolution, crop, mic, system_audio }
+    ashot_core::record::RecordOptions {
+        output,
+        height: resolution,
+        crop,
+        mic,
+        system_audio,
+        voice_process,
+    }
 }
 
 fn ashot_record_start(
