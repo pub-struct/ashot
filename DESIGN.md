@@ -153,6 +153,36 @@ Rust with GPUI (Zed's UI framework).
   preview with the same annotation tools, timeline with cut ranges, zoom
   markers, playhead scrubbing. Export progress via shared-state ticker.
 
+## Crop session (revised 2026-08-18)
+- **Freeze-frame, not a live transparent window.** Picking Crop unmaps the
+  pill, takes a portal screenshot, and shows that still fullscreen in an
+  **opaque** window with the pill on top. The earlier live version was a
+  fullscreen translucent surface, which made blur-behind compositors
+  (Hyprland ships `decoration:blur` on, size 8 / 3 passes) blur the entire
+  desktop the user was trying to frame — and let the screen change between
+  framing and firing.
+- **What is framed is what fires.** A framed screenshot is cut out of that
+  same still, so there is no second portal round-trip and no window in which
+  the desktop can drift; the preview overlay is handed the still before the
+  session unmaps, so the two fullscreen windows never flash the desktop
+  between them.
+- **The region stays editable**: drag to draw, drag inside to move (the shift
+  is clamped, not the corners, so edges slide instead of squashing), eight
+  grips to resize. The red button is visibly disabled until a region exists —
+  it used to swallow the click and read as broken.
+- **R re-shoots the still**, keeping the framed region, for when the desktop
+  has moved on since the session opened (the flip side of freezing it). The
+  window must unmap for the shutter or it photographs itself, so this is a
+  close-capture-reopen; the region rides across in `LauncherState::sel`, valid
+  because every session is fullscreen on the same display.
+- **Selection → pixels comes off the still**, not from `capture::monitors()`.
+  The old mapping re-enumerated Wayland outputs inside a per-frame label, i.e.
+  a fresh connection plus three roundtrips on every mouse-move.
+- Test hooks (no input injection available): `ASHOT_TEST_MODE=crop-session`
+  (preset region), `crop-fire` (preset + fire), `crop-empty` (unframed state),
+  `crop-refresh` (preset + re-shoot; fires once — a carried region is the
+  signal that the re-opened session must not schedule another).
+
 ## Known risks / later
 - GPUI git-dep breakage on rev bumps (mitigated by pinning + crate isolation).
 - Global hotkeys on GNOME Wayland need the GlobalShortcuts portal (M2 concern).

@@ -117,16 +117,19 @@ pub fn generate(input: &Path, srt_out: &Path, mut progress: impl FnMut(&str)) ->
         .full(params, &samples)
         .map_err(|e| Error::Record(format!("whisper: {e}")))?;
 
-    let n = state
-        .full_n_segments()
-        .map_err(|e| Error::Record(format!("whisper segments: {e}")))?;
+    // whisper-rs 0.16 moved the per-segment accessors onto a WhisperSegment
+    // handle, and full_n_segments() now returns the count directly, not a Result.
+    let n = state.full_n_segments();
     let mut srt = String::new();
     for i in 0..n {
-        let text = state
-            .full_get_segment_text(i)
+        let segment = state
+            .get_segment(i)
+            .ok_or_else(|| Error::Record(format!("segment {i} missing")))?;
+        let text = segment
+            .to_str_lossy()
             .map_err(|e| Error::Record(format!("segment text: {e}")))?;
-        let t0 = state.full_get_segment_t0(i).unwrap_or(0);
-        let t1 = state.full_get_segment_t1(i).unwrap_or(t0 + 100);
+        let t0 = segment.start_timestamp();
+        let t1 = segment.end_timestamp();
         srt.push_str(&format!(
             "{}\n{} --> {}\n{}\n\n",
             i + 1,
